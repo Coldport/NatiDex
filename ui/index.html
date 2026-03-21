@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NatiDex — Training Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            dark: '#0b0b14',
+            card: '#13131f',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background: radial-gradient(ellipse at 20% 20%, #1a0a2e 0%, #0b0b14 50%);
+      min-height: 100vh;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      color: #e2e8f0;
+    }
+    .glass {
+      background: rgba(19, 19, 31, 0.85);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+    }
+    .glow-purple { box-shadow: 0 0 30px rgba(124, 58, 237, 0.15), 0 1px 0 rgba(255,255,255,0.05) inset; }
+    .glow-blue   { box-shadow: 0 0 30px rgba(37, 99, 235, 0.15),  0 1px 0 rgba(255,255,255,0.05) inset; }
+    .bar { transition: width 0.5s cubic-bezier(.4,0,.2,1); }
+    @keyframes pulse-glow { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+    .pulse { animation: pulse-glow 1.5s ease-in-out infinite; }
+    @keyframes fadeSlide { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+    .fade-in { animation: fadeSlide .25s ease; }
+    .wiki-extract p { margin-bottom: 0.75em; }
+    .wiki-extract p:last-child { margin-bottom: 0; }
+    scrollbar-width: thin;
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #ffffff20; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const WS_URL = `ws://${location.host}/ws`;
+    const api = (path) => fetch(path, { method: 'POST' }).catch(console.error);
+
+    // ── SVG Line Chart ───────────────────────────────────────────────
+    function LineChart({ data, keys, colors }) {
+      if (data.length < 2) {
+        return (
+          <div className="flex items-center justify-center h-full text-slate-600 text-sm">
+            Waiting for epoch data...
+          </div>
+        );
+      }
+      const W = 500, H = 150, P = { t: 8, r: 12, b: 28, l: 38 };
+      const iW = W - P.l - P.r, iH = H - P.t - P.b;
+      const vals = keys.flatMap(k => data.map(d => d[k])).filter(v => v != null && !isNaN(v));
+      const minV = Math.min(...vals), maxV = Math.max(...vals);
+      const range = maxV - minV || 0.01;
+      const xS = i => P.l + (i / (data.length - 1)) * iW;
+      const yS = v => P.t + iH - ((v - minV) / range) * iH;
+      const path = k => data.filter(d => d[k] != null)
+        .map((d, i) => `${i === 0 ? 'M' : 'L'}${xS(i).toFixed(1)},${yS(d[k]).toFixed(1)}`).join(' ');
+      const yTicks = [0, 0.25, 0.5, 0.75, 1].map(t => minV + t * range);
+      const xStep = Math.max(1, Math.ceil(data.length / 5));
+
+      return (
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full" preserveAspectRatio="xMidYMid meet">
+          {/* Grid lines */}
+          {yTicks.map((v, i) => (
+            <g key={i}>
+              <line x1={P.l} y1={yS(v)} x2={W - P.r} y2={yS(v)} stroke="#ffffff08" strokeWidth="1" />
+              <text x={P.l - 5} y={yS(v) + 4} textAnchor="end" fill="#475569" fontSize="9">
+                {v.toFixed(2)}
+              </text>
+            </g>
+          ))}
+          {/* X labels */}
+          {data.filter((_, i) => i % xStep === 0 || i === data.length - 1).map((d, _, arr) => {
+            const i = data.indexOf(d);
+            return (
+              <text key={i} x={xS(i)} y={H - 6} textAnchor="middle" fill="#475569" fontSize="9">
+                {d.epoch}
+              </text>
+            );
+          })}
+          {/* Lines */}
+          {keys.map((k, ci) => (
+            <path key={k} d={path(k)} fill="none" stroke={colors[ci]} strokeWidth="2"
+              strokeLinecap="round" strokeLinejoin="round" />
+          ))}
+          {/* End dots */}
+          {keys.map((k, ci) => {
+            const last = data[data.length - 1];
+            if (last?.[k] == null) return null;
+            return <circle key={k} cx={xS(data.length - 1)} cy={yS(last[k])} r="3" fill={colors[ci]} />;
+          })}
+        </svg>
+      );
+    }
+
+    // ── Reusable components ──────────────────────────────────────────
+    function MetricCard({ label, value, color, icon }) {
+      return (
+        <div className="bg-white/[0.04] rounded-2xl p-4 border border-white/[0.07] flex flex-col gap-1">
+          <span className="text-xs text-slate-500 font-medium">{label}</span>
+          <span className={`text-2xl font-bold tabular-nums ${color}`}>
+            {value != null ? value.toFixed(4) : <span className="text-slate-600">—</span>}
+          </span>
+        </div>
+      );
+    }
+
+    function ProgressBar({ pct, color = 'bg-violet-500', thin = false }) {
+      return (
+        <div className={`${thin ? 'h-1' : 'h-2'} bg-white/[0.08] rounded-full overflow-hidden`}>
+          <div className={`h-full ${color} bar rounded-full`} style={{ width: `${Math.min(pct, 100)}%` }} />
+        </div>
+      );
+    }
+
+    const STATUS_MAP = {
+      idle:          { label: 'Idle',           cls: 'bg-slate-800 text-slate-400' },
+      loading_data:  { label: 'Loading Data',   cls: 'bg-amber-950/60 text-amber-300', dot: true },
+      training:      { label: 'Training',       cls: 'bg-violet-950/60 text-violet-300', dot: true },
+      paused:        { label: 'Paused',         cls: 'bg-orange-950/60 text-orange-300' },
+      done:          { label: 'Complete ✓',     cls: 'bg-emerald-950/60 text-emerald-300' },
+      stopped:       { label: 'Stopped',        cls: 'bg-red-950/60 text-red-400' },
+      error:         { label: 'Error',          cls: 'bg-red-950/60 text-red-400' },
+    };
+    function Badge({ status }) {
+      const { label, cls, dot } = STATUS_MAP[status] || STATUS_MAP.idle;
+      return (
+        <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${cls}`}>
+          {dot && <span className="w-1.5 h-1.5 rounded-full bg-current pulse" />}
+          {label}
+        </span>
+      );
+    }
+
+    // ── Training Panel ───────────────────────────────────────────────
+    function TrainingPanel({ connected }) {
+      const [status, setStatus]     = useState('idle');
+      const [phase, setPhase]       = useState(1);
+      const [metrics, setMetrics]   = useState([]);
+      const [latest, setLatest]     = useState({});
+      const [batch, setBatch]       = useState(null);
+      const [deviceInfo, setDevice] = useState(null);
+      const [chart, setChart]       = useState('accuracy');
+
+      useEffect(() => {
+        const handler = ({ detail: d }) => {
+          if (d.type === 'train_info') {
+            setDevice({ type: d.device, name: d.device_name });
+          } else if (d.type === 'train_batch') {
+            setBatch(d);
+          } else if (d.type === 'train_metrics') {
+            setBatch(null);
+            setLatest(d);
+            setPhase(d.phase);
+            setMetrics(prev => [...prev.slice(-99), d]);
+          } else if (d.type === 'train_status') {
+            setStatus(d.status);
+            if (d.phase) setPhase(d.phase);
+          }
+        };
+        window.addEventListener('ws_message', handler);
+        return () => window.removeEventListener('ws_message', handler);
+      }, []);
+
+      const running = status === 'training' || status === 'loading_data';
+      const paused  = status === 'paused';
+      const epochPct = latest.total_epochs ? (latest.epoch / latest.total_epochs) * 100 : 0;
+
+      return (
+        <div className="glass glow-purple rounded-3xl border border-white/[0.08] p-6 flex flex-col gap-5">
+          {/* Header */}
+          <div className="flex items-start justify-between">
+            <div>
+              <h2 className="text-base font-bold text-white">Model Training</h2>
+              <p className="text-xs text-slate-500 mt-0.5">MobileNetV2 · Transfer Learning</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {deviceInfo && (
+                <span className={`text-xs px-2 py-1 rounded-lg font-mono font-semibold ${
+                  deviceInfo.type === 'CUDA'
+                    ? 'bg-emerald-950/60 text-emerald-400 border border-emerald-500/20'
+                    : 'bg-amber-950/60 text-amber-400 border border-amber-500/20'
+                }`} title={deviceInfo.name}>
+                  {deviceInfo.type === 'CUDA' ? 'GPU' : 'CPU'}
+                </span>
+              )}
+              <span className="text-xs bg-white/[0.06] text-slate-400 px-2 py-1 rounded-lg font-mono">
+                Phase {phase}/2
+              </span>
+              <Badge status={status} />
+            </div>
+          </div>
+
+          {/* Metrics */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <MetricCard label="Loss"     value={latest.loss}         color="text-rose-400" />
+            <MetricCard label="Accuracy" value={latest.accuracy}     color="text-violet-400" />
+            <MetricCard label="Val Loss" value={latest.val_loss}     color="text-orange-400" />
+            <MetricCard label="Val Acc"  value={latest.val_accuracy} color="text-emerald-400" />
+          </div>
+
+          {/* Chart */}
+          <div className="bg-white/[0.03] rounded-2xl p-4 border border-white/[0.06]">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-xs text-slate-500 font-medium">Training History</span>
+              <div className="flex gap-1 bg-white/[0.05] p-0.5 rounded-lg">
+                {['accuracy', 'loss'].map(m => (
+                  <button key={m} onClick={() => setChart(m)}
+                    className={`px-3 py-1 rounded-md text-xs font-medium transition ${
+                      chart === m ? 'bg-violet-600 text-white' : 'text-slate-400 hover:text-white'
+                    }`}>
+                    {m.charAt(0).toUpperCase() + m.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="h-36">
+              <LineChart
+                data={metrics}
+                keys={chart === 'accuracy' ? ['accuracy', 'val_accuracy'] : ['loss', 'val_loss']}
+                colors={chart === 'accuracy' ? ['#818cf8', '#34d399'] : ['#f87171', '#fb923c']}
+              />
+            </div>
+            <div className="flex gap-5 mt-3 justify-center text-xs text-slate-500">
+              {chart === 'accuracy' ? (
+                <>
+                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-indigo-400 inline-block rounded" />Train</span>
+                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-emerald-400 inline-block rounded" />Validation</span>
+                </>
+              ) : (
+                <>
+                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-rose-400 inline-block rounded" />Train</span>
+                  <span className="flex items-center gap-1.5"><span className="w-4 h-0.5 bg-orange-400 inline-block rounded" />Validation</span>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Epoch + batch progress */}
+          {(running || paused) && (
+            <div className="space-y-3">
+              {/* Epoch bar */}
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-xs text-slate-500">
+                  <span>Epoch {(batch && batch.epoch) || latest.epoch || 0} / {latest.total_epochs ?? 50}</span>
+                  <span>{epochPct.toFixed(0)}%</span>
+                </div>
+                <ProgressBar pct={epochPct} color={paused ? 'bg-orange-500' : 'bg-violet-500'} />
+              </div>
+
+              {/* Batch bar */}
+              {batch && batch.total_batches > 0 && (
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs text-slate-600">
+                    <span className={batch.is_train ? 'text-violet-400' : 'text-blue-400'}>
+                      {batch.is_train ? 'Training' : 'Validating'} — batch {batch.batch} / {batch.total_batches}
+                    </span>
+                    <span className="tabular-nums">
+                      loss {batch.running_loss.toFixed(4)}
+                      {' · '}
+                      acc {(batch.running_acc * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <ProgressBar thin
+                    pct={(batch.batch / batch.total_batches) * 100}
+                    color={batch.is_train ? 'bg-violet-400' : 'bg-blue-400'}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Controls */}
+          <div className="flex gap-3 pt-1">
+            {!running && !paused && (
+              <button onClick={() => api('/train/start')} disabled={!connected}
+                className="flex-1 py-3 rounded-2xl bg-violet-600 hover:bg-violet-500 active:bg-violet-700 disabled:opacity-30 disabled:cursor-not-allowed text-white font-semibold text-sm transition">
+                Start Training
+              </button>
+            )}
+            {running && (
+              <button onClick={() => api('/train/pause')}
+                className="flex-1 py-3 rounded-2xl bg-orange-600/80 hover:bg-orange-500 text-white font-semibold text-sm transition">
+                Pause
+              </button>
+            )}
+            {paused && (
+              <button onClick={() => api('/train/resume')}
+                className="flex-1 py-3 rounded-2xl bg-violet-600 hover:bg-violet-500 text-white font-semibold text-sm transition">
+                Resume
+              </button>
+            )}
+            {(running || paused) && (
+              <button onClick={() => api('/train/stop')}
+                className="px-6 py-3 rounded-2xl bg-red-700/60 hover:bg-red-600 text-white font-semibold text-sm transition border border-red-500/20">
+                Stop
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Download Panel ───────────────────────────────────────────────
+    function DownloadPanel({ connected }) {
+      const [status, setStatus]             = useState('idle');
+      const [overall, setOverall]           = useState(0);
+      const [dlCount, setDlCount]           = useState(0);
+      const [dlTotal, setDlTotal]           = useState(0);
+      const [speciesList, setSpeciesList]   = useState([]);
+      const [activeIdx, setActiveIdx]       = useState(null);
+      const [speciesLimit, setSpeciesLimit] = useState(400);
+      const [photosPerSp, setPhotosPerSp]   = useState(50);
+      const listRef = useRef(null);
+
+      useEffect(() => {
+        const handler = ({ detail: d }) => {
+          if (d.type === 'download_status') {
+            setStatus(d.status === 'fetching_species' ? 'fetching' : d.status);
+          } else if (d.type === 'download_init') {
+            setStatus('running');
+            const total = d.photos_per_species ?? 50;
+            setSpeciesList(d.species.map(name => ({
+              name, pct: 0, downloaded: 0, total, done: false, skipped: false
+            })));
+          } else if (d.type === 'download_species_start') {
+            setActiveIdx(d.species_idx);
+          } else if (d.type === 'download_progress') {
+            setOverall(d.overall_pct);
+            setDlCount(d.overall_downloaded);
+            setDlTotal(d.overall_total);
+            setSpeciesList(prev => {
+              const next = [...prev];
+              if (next[d.species_idx]) {
+                next[d.species_idx] = { ...next[d.species_idx], pct: d.species_pct, downloaded: d.downloaded };
+              }
+              return next;
+            });
+          } else if (d.type === 'download_species_done') {
+            setOverall(d.overall_pct);
+            setDlCount(d.overall_downloaded ?? dlCount);
+            setDlTotal(d.overall_total ?? dlTotal);
+            setActiveIdx(null);
+            setSpeciesList(prev => {
+              const next = [...prev];
+              if (next[d.species_idx]) {
+                next[d.species_idx] = {
+                  ...next[d.species_idx], pct: 100,
+                  downloaded: d.downloaded, done: true, skipped: d.skipped
+                };
+              }
+              return next;
+            });
+          }
+        };
+        window.addEventListener('ws_message', handler);
+        return () => window.removeEventListener('ws_message', handler);
+      }, [dlCount, dlTotal]);
+
+      // Auto-scroll active species into view
+      useEffect(() => {
+        if (activeIdx != null && listRef.current) {
+          const el = listRef.current.children[activeIdx];
+          el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+      }, [activeIdx]);
+
+      const isRunning  = status === 'running' || status === 'fetching';
+      const doneCount  = speciesList.filter(s => s.done).length;
+
+      const dlStatusLabel = {
+        idle: 'Idle', fetching: 'Fetching Species', running: 'Downloading',
+        done: 'Complete ✓', stopped: 'Stopped',
+      }[status] || status;
+
+      return (
+        <div className="glass glow-blue rounded-3xl border border-white/[0.08] p-6 flex flex-col gap-5">
+          {/* Header */}
+          <div className="flex items-start justify-between">
+            <div>
+              <h2 className="text-base font-bold text-white">Data Downloader</h2>
+              <p className="text-xs text-slate-500 mt-0.5">iNaturalist · Research Grade</p>
+            </div>
+            <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${
+              isRunning ? 'bg-blue-950/60 text-blue-300' :
+              status === 'done' ? 'bg-emerald-950/60 text-emerald-300' :
+              status === 'stopped' ? 'bg-red-950/60 text-red-400' :
+              'bg-slate-800 text-slate-400'
+            }`}>
+              {isRunning && <span className="w-1.5 h-1.5 rounded-full bg-blue-400 pulse" />}
+              {dlStatusLabel}
+            </span>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              { label: 'Overall', value: `${overall.toFixed(1)}%`, color: 'text-blue-400' },
+              { label: 'Species Done', value: `${doneCount}/${speciesList.length}`, color: 'text-violet-400' },
+              { label: 'Photos', value: dlCount.toLocaleString(), color: 'text-emerald-400' },
+            ].map(({ label, value, color }) => (
+              <div key={label} className="bg-white/[0.04] rounded-2xl p-4 border border-white/[0.07]">
+                <div className="text-xs text-slate-500 font-medium mb-1">{label}</div>
+                <div className={`text-xl font-bold tabular-nums ${color}`}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Overall progress */}
+          <div className="space-y-1.5">
+            <div className="flex justify-between text-xs text-slate-500">
+              <span>Overall Progress</span>
+              <span>{dlCount.toLocaleString()} / {dlTotal.toLocaleString()} photos</span>
+            </div>
+            <ProgressBar pct={overall} color="bg-blue-500" />
+          </div>
+
+          {/* Per-species list */}
+          <div className="bg-white/[0.03] rounded-2xl border border-white/[0.06] overflow-hidden flex-1 flex flex-col min-h-0">
+            <div className="px-4 py-2.5 border-b border-white/[0.06] flex justify-between text-xs text-slate-500 font-medium">
+              <span>Per-Species Progress</span>
+              <span>{speciesList.length} species</span>
+            </div>
+            <div className="overflow-y-auto divide-y divide-white/[0.04]" ref={listRef}
+              style={{ maxHeight: '260px' }}>
+              {speciesList.length === 0 ? (
+                <div className="px-4 py-10 text-center text-slate-600 text-sm">
+                  Start download to see per-species progress
+                </div>
+              ) : speciesList.map((sp, i) => (
+                <div key={i}
+                  className={`px-4 py-3 fade-in transition ${i === activeIdx ? 'bg-blue-900/10' : ''}`}>
+                  <div className="flex justify-between text-xs mb-1.5">
+                    <span className={`font-medium truncate max-w-[70%] ${
+                      sp.done && sp.skipped ? 'text-slate-600' :
+                      sp.done ? 'text-emerald-400' :
+                      i === activeIdx ? 'text-blue-300' : 'text-slate-400'
+                    }`}>
+                      {sp.name.replace(/_/g, ' ')}
+                    </span>
+                    <span className="text-slate-600 shrink-0 ml-2">
+                      {sp.skipped ? 'cached' : `${sp.downloaded}/${sp.total}`}
+                    </span>
+                  </div>
+                  <ProgressBar thin pct={sp.pct}
+                    color={
+                      sp.done && sp.skipped ? 'bg-slate-700' :
+                      sp.done ? 'bg-emerald-500' :
+                      i === activeIdx ? 'bg-blue-500' : 'bg-slate-700'
+                    }
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Config inputs */}
+          {!isRunning && (
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { label: 'Species limit', value: speciesLimit, set: setSpeciesLimit, min: 2, max: 999999 },
+                { label: 'Photos / species', value: photosPerSp, set: setPhotosPerSp, min: 1, max: 999999 },
+              ].map(({ label, value, set, min, max }) => (
+                <div key={label} className="bg-white/[0.04] rounded-2xl p-3 border border-white/[0.07]">
+                  <label className="text-xs text-slate-500 font-medium block mb-1.5">{label}</label>
+                  <input
+                    type="number" value={value} min={min} max={max}
+                    onChange={e => set(Math.max(min, Math.min(max, Number(e.target.value))))}
+                    className="w-full bg-transparent text-white text-lg font-bold outline-none tabular-nums"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Controls */}
+          <div className="flex gap-3 pt-1">
+            {!isRunning ? (
+              <button
+                onClick={() => fetch('/download/start', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ species_limit: speciesLimit, photos_per_species: photosPerSp }),
+                })}
+                disabled={!connected}
+                className="flex-1 py-3 rounded-2xl bg-blue-600 hover:bg-blue-500 active:bg-blue-700 disabled:opacity-30 disabled:cursor-not-allowed text-white font-semibold text-sm transition">
+                {status === 'done' ? 'Re-download' : 'Start Download'}
+              </button>
+            ) : (
+              <button onClick={() => api('/download/stop')}
+                className="flex-1 py-3 rounded-2xl bg-red-700/60 hover:bg-red-600 text-white font-semibold text-sm transition border border-red-500/20">
+                Stop Download
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Camera Modal ─────────────────────────────────────────────────
+    function CameraModal({ onCapture, onClose }) {
+      const videoRef  = useRef(null);
+      const streamRef = useRef(null);
+      const [err, setErr] = useState(null);
+
+      useEffect(() => {
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+          .then(stream => {
+            streamRef.current = stream;
+            if (videoRef.current) videoRef.current.srcObject = stream;
+          })
+          .catch(() => setErr('Camera unavailable or permission denied.'));
+        return () => {
+          if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+        };
+      }, []);
+
+      const capture = () => {
+        const v = videoRef.current;
+        if (!v) return;
+        const canvas = document.createElement('canvas');
+        canvas.width  = v.videoWidth;
+        canvas.height = v.videoHeight;
+        canvas.getContext('2d').drawImage(v, 0, 0);
+        canvas.toBlob(blob => {
+          onCapture(new File([blob], 'photo.jpg', { type: 'image/jpeg' }));
+        }, 'image/jpeg', 0.92);
+      };
+
+      return (
+        <div className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center gap-5 p-6">
+          {err ? (
+            <div className="text-center space-y-4">
+              <p className="text-slate-400 text-sm">{err}</p>
+              <button onClick={onClose}
+                className="px-6 py-2 rounded-2xl bg-white/10 hover:bg-white/20 text-white text-sm font-semibold transition">
+                Close
+              </button>
+            </div>
+          ) : (
+            <>
+              <video ref={videoRef} autoPlay playsInline
+                className="rounded-2xl w-full max-w-md max-h-[60vh] object-cover bg-black" />
+              <div className="flex gap-4">
+                <button onClick={capture}
+                  className="px-8 py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm transition">
+                  Capture
+                </button>
+                <button onClick={onClose}
+                  className="px-8 py-3 rounded-2xl bg-white/10 hover:bg-white/20 text-white font-semibold text-sm transition">
+                  Cancel
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // ── Wiki Modal ───────────────────────────────────────────────────
+    function WikiModal({ species, commonName, onClose }) {
+      const [data, setData]     = useState(null);
+      const [imgErr, setImgErr] = useState(false);
+
+      useEffect(() => {
+        if (!species) return;
+        setData(null); setImgErr(false);
+        const key = species.replace(/ /g, '_');
+        fetch(`/wiki_data/${key}`)
+          .then(r => r.ok ? r.json() : null)
+          .then(setData)
+          .catch(() => setData(null));
+      }, [species]);
+
+      if (!species) return null;
+      const imgSrc = `/wiki_img/${species.replace(/ /g, '_')}`;
+      const facts  = data && data.facts;
+
+      return (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+          onClick={onClose}>
+          <div className="glass rounded-3xl border border-white/[0.1] p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}>
+
+            {/* Header */}
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                {commonName && <h3 className="text-lg font-bold text-white">{commonName}</h3>}
+                <p className="text-sm italic text-slate-400">{species}</p>
+                {data && data.description && !commonName && (
+                  <p className="text-xs text-slate-500 mt-0.5">{data.description}</p>
+                )}
+              </div>
+              <button onClick={onClose}
+                className="text-slate-500 hover:text-white text-xl leading-none ml-4 shrink-0">&times;</button>
+            </div>
+
+            {/* Thumbnail */}
+            {data && data.has_image && !imgErr && (
+              <img src={imgSrc} alt={species}
+                className="w-full rounded-2xl object-cover mb-4 max-h-56"
+                onError={() => setImgErr(true)} />
+            )}
+
+            {/* Facts badges */}
+            {facts && (
+              <div className="flex flex-wrap gap-2 mb-4">
+                {facts.venomous  && <span className="px-3 py-1 rounded-full text-xs font-semibold bg-red-950/60 text-red-300 border border-red-500/20">Venomous</span>}
+                {facts.poisonous && <span className="px-3 py-1 rounded-full text-xs font-semibold bg-orange-950/60 text-orange-300 border border-orange-500/20">Poisonous</span>}
+                {facts.dangerous && !facts.venomous && !facts.poisonous && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-amber-950/60 text-amber-300 border border-amber-500/20">Dangerous</span>
+                )}
+                {!facts.venomous && !facts.poisonous && !facts.dangerous && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950/60 text-emerald-300 border border-emerald-500/20">Generally harmless</span>
+                )}
+                {facts.size && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-blue-950/60 text-blue-300 border border-blue-500/20">
+                    Size: {facts.size}
+                  </span>
+                )}
+                {facts.mass && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-slate-800 text-slate-300 border border-white/10">
+                    Mass: {facts.mass}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Article text */}
+            {data && data.extract_html ? (
+              <div className="text-sm text-slate-300 leading-relaxed wiki-extract"
+                dangerouslySetInnerHTML={{ __html: data.extract_html }} />
+            ) : (
+              <p className="text-slate-500 text-sm mt-2">
+                {data === null ? 'Loading\u2026' : 'Wikipedia article not available offline. Run a download to fetch it.'}
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Inference Panel ──────────────────────────────────────────────
+    function InferencePanel() {
+      const [preview, setPreview]         = useState(null);
+      const [results, setResults]         = useState([]);
+      const [loading, setLoading]         = useState(false);
+      const [error, setError]             = useState(null);
+      const [dragging, setDragging]       = useState(false);
+      const [wikiSpecies, setWikiSpecies] = useState(null);
+      const [wikiCommon, setWikiCommon]   = useState('');
+      const [cameraOpen, setCameraOpen]   = useState(false);
+      const inputRef   = useRef(null);
+      const captureRef = useRef(null);
+
+      const runInference = async (file) => {
+        setError(null);
+        setResults([]);
+        setLoading(true);
+        const form = new FormData();
+        form.append('file', file);
+        try {
+          const res = await fetch('/infer?top_k=5', { method: 'POST', body: form });
+          if (!res.ok) {
+            const j = await res.json();
+            throw new Error(j.detail || 'Inference failed');
+          }
+          const { predictions } = await res.json();
+          setResults(predictions);
+        } catch (e) {
+          setError(e.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const onFile = (file) => {
+        if (!file || !file.type.startsWith('image/')) return;
+        setPreview(URL.createObjectURL(file));
+        runInference(file);
+      };
+
+      const onDrop = (e) => {
+        e.preventDefault();
+        setDragging(false);
+        onFile(e.dataTransfer.files[0]);
+      };
+
+      const maxConf = (results[0] && results[0].confidence) || 1;
+
+      return (
+        <React.Fragment>
+        <div className="glass rounded-3xl border border-white/[0.08] p-6 flex flex-col gap-5"
+          style={{ boxShadow: '0 0 30px rgba(16,185,129,0.12), 0 1px 0 rgba(255,255,255,0.05) inset' }}>
+          <div>
+            <h2 className="text-base font-bold text-white">Identify Species</h2>
+            <p className="text-xs text-slate-500 mt-0.5">Drop an image to run inference</p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+            {/* Drop zone */}
+            <div
+              onClick={() => inputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={onDrop}
+              className={`relative cursor-pointer rounded-2xl border-2 border-dashed flex items-center justify-center overflow-hidden transition ${
+                dragging ? 'border-emerald-400 bg-emerald-950/20' : 'border-white/10 hover:border-white/20 bg-white/[0.02]'
+              }`}
+              style={{ minHeight: '180px' }}>
+              {preview ? (
+                <img src={preview} alt="preview"
+                  className="w-full h-full object-cover absolute inset-0 rounded-2xl" />
+              ) : (
+                <div className="text-center p-6 select-none">
+                  <p className="text-sm text-slate-400">Click or drag an image</p>
+                  <p className="text-xs text-slate-600 mt-1">JPG, PNG, WEBP</p>
+                </div>
+              )}
+              {loading && (
+                <div className="absolute inset-0 bg-black/60 flex items-center justify-center rounded-2xl">
+                  <div className="w-8 h-8 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                </div>
+              )}
+              <input ref={inputRef} type="file" accept="image/*" className="hidden"
+                onChange={e => onFile(e.target.files[0])} />
+              <input ref={captureRef} type="file" accept="image/*" capture="environment" className="hidden"
+                onChange={e => onFile(e.target.files[0])} />
+              {/* Camera button — bottom-right corner of drop zone */}
+              <button
+                onClick={e => {
+                  e.stopPropagation();
+                  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    setCameraOpen(true);
+                  } else {
+                    captureRef.current && captureRef.current.click();
+                  }
+                }}
+                className="absolute bottom-3 right-3 px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 text-xs font-medium transition border border-white/10">
+                Camera
+              </button>
+            </div>
+
+            {/* Results */}
+            <div className="flex flex-col justify-center gap-2">
+              {error && (
+                <div className="text-xs text-red-400 bg-red-950/30 border border-red-500/20 rounded-xl px-3 py-2">
+                  {error}
+                </div>
+              )}
+              {results.length === 0 && !loading && !error && (
+                <p className="text-slate-600 text-sm text-center">No prediction yet</p>
+              )}
+              {results.map((r, i) => (
+                <div key={i} className="fade-in cursor-pointer hover:bg-white/[0.04] rounded-xl px-2 -mx-2 py-1 transition"
+                  onClick={() => { setWikiSpecies(r.species); setWikiCommon(r.common_name || ''); }}>
+                  <div className="flex justify-between items-start text-xs mb-1">
+                    <span className="flex flex-col">
+                      {r.common_name && (
+                        <span className={`font-semibold not-italic leading-tight ${i === 0 ? 'text-emerald-200' : 'text-slate-300'}`}>
+                          {r.common_name}
+                        </span>
+                      )}
+                      <span className={`italic leading-tight ${i === 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
+                        {r.species}
+                      </span>
+                    </span>
+                    <span className={`tabular-nums shrink-0 ml-2 ${i === 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
+                      {(r.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+                    <div className="h-full bar rounded-full"
+                      style={{
+                        width: `${(r.confidence / maxConf) * 100}%`,
+                        background: i === 0 ? '#10b981' : '#334155',
+                      }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <WikiModal species={wikiSpecies} commonName={wikiCommon} onClose={() => setWikiSpecies(null)} />
+        {cameraOpen && (
+          <CameraModal
+            onCapture={file => { setCameraOpen(false); onFile(file); }}
+            onClose={() => setCameraOpen(false)}
+          />
+        )}
+        </React.Fragment>
+      );
+    }
+
+    // ── App root ─────────────────────────────────────────────────────
+    function App() {
+      const [connected, setConnected] = useState(false);
+      const wsRef = useRef(null);
+
+      useEffect(() => {
+        // Restore state from server on first load
+        fetch('/status')
+          .then(r => r.json())
+          .then(({ train, download }) => {
+            // Replay training state
+            if (train.device) {
+              window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'train_info', device: train.device, device_name: train.device_name } }));
+            }
+            if (train.status !== 'idle') {
+              window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'train_status', status: train.status, phase: train.phase } }));
+            }
+            if (train.history?.length) {
+              train.history.forEach(h => window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'train_metrics', ...h, phase: train.phase, total_epochs: train.total_epochs } })));
+            }
+            // Replay download state
+            if (download.species?.length) {
+              window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'download_init', species: download.species.map(s => s.name), photos_per_species: download.species[0]?.total ?? 50 } }));
+              download.species.forEach((sp, i) => {
+                if (sp.done) {
+                  window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'download_species_done', species: sp.name, species_idx: i, downloaded: sp.downloaded, total: sp.total, skipped: sp.skipped, overall_pct: download.overall_pct, overall_downloaded: download.overall_downloaded, overall_total: download.overall_total } }));
+                } else if (sp.downloaded > 0) {
+                  window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'download_progress', species: sp.name, species_idx: i, downloaded: sp.downloaded, total: sp.total, species_pct: sp.pct, overall_pct: download.overall_pct, overall_downloaded: download.overall_downloaded, overall_total: download.overall_total } }));
+                }
+              });
+              if (download.status !== 'idle') {
+                window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'download_status', status: download.status } }));
+              }
+            }
+          })
+          .catch(() => {});
+
+        function connect() {
+          const ws = new WebSocket(WS_URL);
+          wsRef.current = ws;
+          ws.onopen  = () => setConnected(true);
+          ws.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
+          ws.onerror = () => ws.close();
+          ws.onmessage = ({ data }) => {
+            try {
+              window.dispatchEvent(new CustomEvent('ws_message', { detail: JSON.parse(data) }));
+            } catch {}
+          };
+        }
+        connect();
+        return () => wsRef.current?.close();
+      }, []);
+
+      return (
+        <div className="min-h-screen p-6 max-w-6xl mx-auto flex flex-col gap-8">
+          {/* Header */}
+          <header className="flex items-center justify-between">
+            <div>
+              <h1 className="text-3xl font-extrabold tracking-tight">
+                Nati<span className="text-violet-400">Dex</span>
+              </h1>
+              <p className="text-sm text-slate-500 mt-0.5">Species Classifier · Training Dashboard</p>
+            </div>
+            <div className={`flex items-center gap-2.5 text-xs px-4 py-2 rounded-full border font-medium ${
+              connected
+                ? 'border-emerald-500/30 text-emerald-400 bg-emerald-950/30'
+                : 'border-red-500/30 text-red-400 bg-red-950/30'
+            }`}>
+              <span className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-400 pulse' : 'bg-red-500'}`} />
+              {connected ? 'Connected' : 'Reconnecting…'}
+            </div>
+          </header>
+
+          {/* Panels */}
+          <main className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+            <TrainingPanel connected={connected} />
+            <DownloadPanel connected={connected} />
+          </main>
+
+          {/* Inference */}
+          <InferencePanel />
+
+          <footer className="text-center text-slate-700 text-xs pb-2">
+            NatiDex · MobileNetV2 + iNaturalist
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
