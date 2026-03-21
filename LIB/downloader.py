@@ -30,13 +30,77 @@ class _TextExtractor(HTMLParser):
         return " ".join(self._parts)
 
 
-def _extract_facts(text: str) -> dict:
+def _extract_facts(text: str, title: str = "") -> dict:
     """Parse safety flags, size, and mass from plain Wikipedia intro text."""
     t = text.lower()
+    n = title.lower()   # species/common name used for name-based hints
 
-    venomous  = bool(re.search(r'\bvenomous\b', t))  and not re.search(r'\bnon.venomous\b|\bnot venomous\b', t)
-    poisonous = bool(re.search(r'\bpoisonous\b', t)) and not re.search(r'\bnot poisonous\b|\bnon.poisonous\b', t)
-    dangerous = bool(re.search(r'\bdangerous\b|\bdeadly\b|\bfatal\b|\battacks? humans?\b', t))
+    # ── Venomous ──────────────────────────────────────────────────────
+    # Text patterns: direct mentions of venom delivery
+    venomous = bool(re.search(
+        r'\bvenomous\b|\benvenomat\w+|\bvenom\b'
+        r'|\bpit viper\b|\bviper\b|\badder\b|\bcobra\b|\bmamba\b'
+        r'|\brattlesnake\b|\bkrait\b|\bboomslang\b|\bcopperhead\b'
+        r'|\bfangs?\b|\bsting\b|\bstings\b|\bstinger\b'
+        r'|\bnematocyst\b|\bspinnerets\b|\bparalyses? (?:its )?prey\b',
+        t
+    ))
+    # Name-based: common names AND Latin genera for venomous insects/animals
+    venomous = venomous or bool(re.search(
+        # Common name hints
+        r'\bbee\b|\bwasp\b|\bhornet\b|\bscorpion\b|\byellow.?jacket\b'
+        r'|\bfire ant\b|\bjellyfish\b|\bsea anemone\b'
+        # Latin genera: bees, wasps, hornets, ants
+        r'|\bbombus\b|\bapis\b|\bvespula\b|\bvespa\b|\bpolistes\b'
+        r'|\bsolenopsis\b|\bponera\b',
+        n
+    ))
+    if re.search(r'\bnon.?venomous\b|\bnot venomous\b|\blacks? venom\b', t):
+        venomous = False
+
+    # ── Poisonous ─────────────────────────────────────────────────────
+    poisonous = bool(re.search(
+        r'\bpoisonous\b|\btoxic\b|\btoxin\b|\bpoison\b'
+        r'|\bneurotoxin\b|\bhemotoxin\b|\bcardiotoxin\b|\btetrodotoxin\b'
+        r'|\bpoisoning\b|\bintoxicat\w+\b'
+        r'|\bunpalatable\b|\bdistasteful to\b'
+        r'|\bdeter(?:s|red)? predators\b|\bchemical defen\w+\b',
+        t
+    ))
+    if re.search(r'\bnot (?:poisonous|toxic)\b|\bnon.?(?:poisonous|toxic)\b', t):
+        poisonous = False
+
+    # ── Dangerous ─────────────────────────────────────────────────────
+    dangerous = bool(re.search(
+        r'\bdangerous\b|\bdeadly\b|\bfatal\b|\blethal\b'
+        r'|\battacks?\s+humans?\b|\battacks?\s+people\b|\battacks?\s+livestock\b'
+        r'|\bman.eating\b|\bman.?killer\b|\bhuman fatalities?\b'
+        r'|\bkills?\s+humans?\b|\bkills?\s+people\b'
+        r'|\bapex predator\b|\btop predator\b|\blarge predator\b'
+        r'|\bknown to (?:attack|kill|bite)\b'
+        r'|\bcan (?:kill|be fatal|be lethal)\b'
+        r'|\bposes? a (?:danger|threat|risk) to humans?\b'
+        r'|\bresponsible for (?:deaths?|fatalities?)\b'
+        r'|\bferocious\b|\baggressive (?:toward|towards|to) humans?\b'
+        # Taxonomic group mentions that imply a predatory mammal
+        r'|\bspecies of canine\b|\bspecies of (?:bear|wolf|fox)\b'
+        r'|\blarge (?:cat|feline|felid)\b|\bbig cat\b'
+        r'|\bspecies of (?:crocodil|alligator)\b',
+        t
+    ))
+    # Name-based: well-known dangerous animals whose Wikipedia intros
+    # often avoid explicit "dangerous" language
+    dangerous = dangerous or bool(re.search(
+        r'\bcoyote\b|\bwolf\b|\bwolves\b|\bwolverine\b'
+        r'|\blion\b|\btiger\b|\bleopard\b|\bjaguar\b'
+        r'|\bcougar\b|\bpuma\b|\bmountain lion\b|\bcheetah\b|\blynx\b|\bbobcat\b'
+        r'|\bgrizzly\b|\bpolar bear\b|\bbrown bear\b|\bblack bear\b|\bbear\b'
+        r'|\bcrocodile\b|\bcrocodilian\b|\balligator\b|\bkomodo dragon\b'
+        r'|\bgreat white\b|\bbull shark\b|\btiger shark\b|\bhammerhead\b'
+        r'|\bmoose\b|\bwild boar\b|\bboar\b|\bcassowary\b'
+        r'|\bhippopotamus\b|\bhippo\b|\bgila monster\b',
+        n   # checked against title + species name
+    ))
 
     def _find(keywords, units):
         kw = '|'.join(keywords)
@@ -58,7 +122,36 @@ def _extract_facts(text: str) -> dict:
         [r"kg\b", r"g\b", r"lb\b", r"lbs\b", r"pound", r"oz\b"],
     )
 
+    # ── Carnivore ─────────────────────────────────────────────────────
+    carnivore = bool(re.search(
+        r'\bcarnivore\b|\bcarnivorous\b'
+        r'|\binsectivore\b|\binsectivorous\b'
+        r'|\bpiscivore\b|\bpiscivorous\b'
+        r'|\bpreys? on\b'
+        r'|\bfeeds? (?:mainly |primarily |largely |exclusively )?on '
+            r'(?:insects?|mammals?|birds?|fish|prey|worms?|invertebrates?|flesh|meat|rodents?)\b'
+        r'|\beats? (?:mainly |primarily |largely )?'
+            r'(?:insects?|mammals?|birds?|fish|prey|worms?|invertebrates?|flesh|meat|rodents?)\b'
+        r'|\bdiet (?:consist|compris|made up).{0,25}'
+            r'(?:insects?|mammals?|birds?|fish|meat|prey|flesh|worms?|invertebrates?)\b'
+        r'|\bprimarily carnivorous\b|\bmainly carnivorous\b|\blargely carnivorous\b',
+        t
+    ))
+
+    # ── Predator ──────────────────────────────────────────────────────
+    predator = bool(re.search(
+        r'\bpredatory\b|\bactive predator\b|\bambush predator\b'
+        r'|\bapex predator\b|\btop predator\b|\blarge predator\b'
+        r'|\bsit.and.wait predator\b|\bgeneralist predator\b|\bspecialist predator\b'
+        r'|\bactive hunter\b|\bhunts? in packs?\b|\bhunts? cooperatively\b'
+        r'|\bstalks? (?:its )?prey\b|\blies? in wait\b'
+        r'|\bpursues? prey\b|\bchases? (?:its )?prey\b'
+        r'|\bis an? (?:\w+ )?predator\b',
+        t
+    ))
+
     return {"venomous": venomous, "poisonous": poisonous, "dangerous": dangerous,
+            "carnivore": carnivore, "predator": predator,
             "size": size, "mass": mass}
 
 
@@ -124,7 +217,7 @@ def _fetch_wiki(name: str, wiki_dir: str) -> None:
         "description":  first_sentence,
         "extract_html": extract_html,
         "has_image":    has_image or os.path.exists(img_file),
-        "facts":        _extract_facts(plain),
+        "facts":        _extract_facts(plain, title=f"{page.get('title', latin)} {name}"),
     }
 
     if has_image:

@@ -629,7 +629,9 @@
                 {facts.dangerous && !facts.venomous && !facts.poisonous && (
                   <span className="px-3 py-1 rounded-full text-xs font-semibold bg-amber-950/60 text-amber-300 border border-amber-500/20">Dangerous</span>
                 )}
-                {!facts.venomous && !facts.poisonous && !facts.dangerous && (
+                {facts.predator  && <span className="px-3 py-1 rounded-full text-xs font-semibold bg-violet-950/60 text-violet-300 border border-violet-500/20">Predator</span>}
+                {facts.carnivore && !facts.predator && <span className="px-3 py-1 rounded-full text-xs font-semibold bg-rose-950/60 text-rose-300 border border-rose-500/20">Carnivore</span>}
+                {!facts.venomous && !facts.poisonous && !facts.dangerous && !facts.predator && !facts.carnivore && (
                   <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-950/60 text-emerald-300 border border-emerald-500/20">Generally harmless</span>
                 )}
                 {facts.size && (

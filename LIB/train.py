@@ -206,17 +206,26 @@ def _train(on_update, data_dir, pause_event, stop_event):
     g       = torch.Generator().manual_seed(42)
     idx     = torch.randperm(n_total, generator=g).tolist()
 
+    use_cuda   = device.type == "cuda"
+    # Parallel workers keep the GPU fed; persistent_workers avoids re-spawning each epoch
+    nw = 16 if use_cuda else 0
     train_loader = DataLoader(
         Subset(ds_train, idx[:n_train]),
-        batch_size=32, shuffle=True, num_workers=0, pin_memory=True,
+        batch_size=128, shuffle=True,
+        num_workers=nw, pin_memory=use_cuda,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
     val_loader = DataLoader(
         Subset(ds_val, idx[n_train:]),
-        batch_size=32, shuffle=False, num_workers=0, pin_memory=True,
+        batch_size=128, shuffle=False,
+        num_workers=nw, pin_memory=use_cuda,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
 
     num_classes = len(ds_train.classes)
-    device_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
+    device_name = torch.cuda.get_device_name(0) if use_cuda else "CPU"
+    print(f"[NatiDex] device={device}  gpu={device_name}  "
+          f"classes={num_classes}  train={n_train}  val={n_val}  workers={nw}")
     on_update({"type": "train_info", "num_classes": num_classes,
                "device": device.type.upper(), "device_name": device_name})
 

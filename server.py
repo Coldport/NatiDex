@@ -17,7 +17,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from LIB.train import TrainingController
-from LIB.downloader import DownloadController
+from LIB.downloader import DownloadController, _extract_facts, _TextExtractor
 from LIB.infer import predict
 
 _connected: set[WebSocket] = set()
@@ -234,7 +234,18 @@ async def wiki_data(species: str):
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="Wiki data not available offline")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    # Re-extract facts for files saved before this feature, or with the old
+    # narrow patterns — runs in-memory, does not modify the file on disk.
+    if data.get("extract_html") and (
+        "facts" not in data
+        or not any(data["facts"].get(k) for k in ("venomous", "poisonous", "dangerous"))
+    ):
+        parser = _TextExtractor()
+        parser.feed(data["extract_html"])
+        data["facts"] = _extract_facts(parser.get_text(),
+                                       title=f"{data.get('title', '')} {species}")
+    return data
 
 
 @app.get("/wiki_img/{species}")
