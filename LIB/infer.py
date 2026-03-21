@@ -35,21 +35,22 @@ def _load():
     if _model is not None:
         return
 
-    with open("class_labels.json") as f:
-        _labels = json.load(f)
-
-    num_classes = len(_labels)
-    m = _build_model(num_classes)
-
+    ckpt = None
     for path in ("best_model.pth", "species_model.pth"):
         try:
             ckpt = torch.load(path, map_location=device, weights_only=True)
-            m.load_state_dict(ckpt["state_dict"])
             break
         except FileNotFoundError:
             continue
-    else:
+    if ckpt is None:
         raise FileNotFoundError("No trained model found. Train first.")
+
+    num_classes = ckpt["num_classes"]
+    m = _build_model(num_classes)
+    m.load_state_dict(ckpt["state_dict"])
+
+    with open("class_labels.json") as f:
+        _labels = json.load(f)
 
     m.to(device).eval()
     _model = m

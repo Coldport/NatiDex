@@ -1,6 +1,8 @@
 import json
+import subprocess
 import threading
 
+import psutil
 import torch
 import torch.nn as nn
 import torchvision
@@ -36,6 +38,50 @@ class TrainingController:
             on_update({"type": "train_status", "status": "error", "message": str(e)})
         finally:
             self._running = False
+
+
+# ── Hardware monitor ─────────────────────────────────────────────────
+
+def _query_gpu_util() -> int | None:
+    """Return GPU compute utilisation % via nvidia-smi (no extra packages needed)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return int(out.stdout.strip().split("\n")[0])
+    except Exception:
+        return None
+
+
+def _hw_monitor(on_update, stop_event):
+    """Background thread: broadcasts CPU% and GPU% every 2 s while training."""
+    # Try to initialise pynvml for real GPU utilisation % (fastest path)
+    _nvml_handle = None
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        pass
+
+    psutil.cpu_percent()  # prime the counter (first call always returns 0)
+
+    while not stop_event.wait(2.0):
+        cpu = psutil.cpu_percent()
+
+        gpu = None
+        if _nvml_handle is not None:
+            try:
+                import pynvml
+                gpu = pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle).gpu
+            except Exception:
+                pass
+        elif device.type == "cuda":
+            gpu = _query_gpu_util()  # real compute % via nvidia-smi
+
+        on_update({"type": "hw_stats", "cpu": round(cpu, 1), "gpu": gpu})
 
 
 # ── Model factory ────────────────────────────────────────────────────
@@ -211,13 +257,13 @@ def _train(on_update, data_dir, pause_event, stop_event):
     nw = 16 if use_cuda else 0
     train_loader = DataLoader(
         Subset(ds_train, idx[:n_train]),
-        batch_size=128, shuffle=True,
+        batch_size=256, shuffle=True,
         num_workers=nw, pin_memory=use_cuda,
         persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
     val_loader = DataLoader(
         Subset(ds_val, idx[n_train:]),
-        batch_size=128, shuffle=False,
+        batch_size=256, shuffle=False,
         num_workers=nw, pin_memory=use_cuda,
         persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
@@ -228,6 +274,10 @@ def _train(on_update, data_dir, pause_event, stop_event):
           f"classes={num_classes}  train={n_train}  val={n_val}  workers={nw}")
     on_update({"type": "train_info", "num_classes": num_classes,
                "device": device.type.upper(), "device_name": device_name})
+
+    # Start hardware monitor
+    hw_stop = threading.Event()
+    threading.Thread(target=_hw_monitor, args=(on_update, hw_stop), daemon=True).start()
 
     # Save index → class name mapping for inference
     idx_to_class = {str(v): k for k, v in ds_train.class_to_idx.items()}
@@ -249,6 +299,7 @@ def _train(on_update, data_dir, pause_event, stop_event):
            num_classes=num_classes)
 
     if stop_event.is_set():
+        hw_stop.set()
         on_update({"type": "train_status", "status": "stopped"})
         return
 
@@ -268,6 +319,8 @@ def _train(on_update, data_dir, pause_event, stop_event):
     _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
            pause_event, stop_event, phase=2, max_epochs=50, max_lr=1e-4,
            num_classes=num_classes)
+
+    hw_stop.set()  # stop hardware monitor
 
     if stop_event.is_set():
         on_update({"type": "train_status", "status": "stopped"})

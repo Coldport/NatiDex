@@ -160,10 +160,13 @@
       const [batch, setBatch]       = useState(null);
       const [deviceInfo, setDevice] = useState(null);
       const [chart, setChart]       = useState('accuracy');
+      const [hwStats, setHwStats]   = useState({ cpu: null, gpu: null });
 
       useEffect(() => {
         const handler = ({ detail: d }) => {
-          if (d.type === 'train_info') {
+          if (d.type === 'hw_stats') {
+            setHwStats({ cpu: d.cpu, gpu: d.gpu });
+          } else if (d.type === 'train_info') {
             setDevice({ type: d.device, name: d.device_name });
           } else if (d.type === 'train_batch') {
             setBatch(d);
@@ -217,6 +220,36 @@
             <MetricCard label="Val Loss" value={latest.val_loss}     color="text-orange-400" />
             <MetricCard label="Val Acc"  value={latest.val_accuracy} color="text-emerald-400" />
           </div>
+
+          {/* Hardware load */}
+          {(hwStats.cpu !== null || hwStats.gpu !== null) && (
+            <div className="grid grid-cols-2 gap-3">
+              {hwStats.cpu !== null && (
+                <div className="bg-white/[0.03] rounded-2xl p-3 border border-white/[0.06]">
+                  <div className="flex justify-between items-center mb-1.5">
+                    <span className="text-xs text-slate-500 font-medium">CPU Load</span>
+                    <span className="text-xs font-mono font-semibold text-amber-400">{hwStats.cpu}%</span>
+                  </div>
+                  <div className="w-full bg-white/[0.06] rounded-full h-1.5">
+                    <div className="h-1.5 rounded-full bg-amber-500 transition-all duration-700"
+                      style={{ width: `${hwStats.cpu}%` }} />
+                  </div>
+                </div>
+              )}
+              {hwStats.gpu !== null && (
+                <div className="bg-white/[0.03] rounded-2xl p-3 border border-white/[0.06]">
+                  <div className="flex justify-between items-center mb-1.5">
+                    <span className="text-xs text-slate-500 font-medium">GPU Compute</span>
+                    <span className="text-xs font-mono font-semibold text-emerald-400">{hwStats.gpu}%</span>
+                  </div>
+                  <div className="w-full bg-white/[0.06] rounded-full h-1.5">
+                    <div className="h-1.5 rounded-full bg-emerald-500 transition-all duration-700"
+                      style={{ width: `${hwStats.gpu}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Chart */}
           <div className="bg-white/[0.03] rounded-2xl p-4 border border-white/[0.06]">
@@ -330,11 +363,20 @@
       const [activeIdx, setActiveIdx]       = useState(null);
       const [speciesLimit, setSpeciesLimit] = useState(400);
       const [photosPerSp, setPhotosPerSp]   = useState(50);
+      const [wikiStatus, setWikiStatus]     = useState('idle');
+      const [wikiDone, setWikiDone]         = useState(0);
+      const [wikiTotal, setWikiTotal]       = useState(0);
+      const [wikiCurrent, setWikiCurrent]   = useState('');
       const listRef = useRef(null);
 
       useEffect(() => {
         const handler = ({ detail: d }) => {
-          if (d.type === 'download_status') {
+          if (d.type === 'wiki_refresh_all') {
+            setWikiStatus(d.status);
+            setWikiDone(d.done ?? 0);
+            setWikiTotal(d.total ?? 0);
+            setWikiCurrent(d.current ?? '');
+          } else if (d.type === 'download_status') {
             setStatus(d.status === 'fetching_species' ? 'fetching' : d.status);
           } else if (d.type === 'download_init') {
             setStatus('running');
@@ -512,6 +554,43 @@
               </button>
             )}
           </div>
+
+          {/* Wiki refresh-all */}
+          <div className="border-t border-white/[0.06] pt-4 flex flex-col gap-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold text-white">Re-download Wiki Info</p>
+                <p className="text-xs text-slate-500 mt-0.5">Refreshes Wikipedia data for all downloaded species</p>
+              </div>
+              {wikiStatus === 'running' ? (
+                <button onClick={() => api('/wiki_refresh_all/stop')}
+                  className="px-4 py-2 rounded-xl bg-red-700/60 hover:bg-red-600 text-white text-xs font-semibold transition border border-red-500/20">
+                  Stop
+                </button>
+              ) : (
+                <button onClick={() => api('/wiki_refresh_all/start')}
+                  disabled={!connected || isRunning}
+                  className="px-4 py-2 rounded-xl bg-emerald-700/80 hover:bg-emerald-600 disabled:opacity-30 disabled:cursor-not-allowed text-white text-xs font-semibold transition">
+                  {wikiStatus === 'done' ? 'Refresh Again' : 'Refresh Wiki'}
+                </button>
+              )}
+            </div>
+            {wikiStatus === 'running' && (
+              <div>
+                <div className="flex justify-between text-xs text-slate-400 mb-1">
+                  <span className="truncate max-w-[60%]">{wikiCurrent.replace(/_/g, ' ')}</span>
+                  <span>{wikiDone} / {wikiTotal}</span>
+                </div>
+                <ProgressBar pct={wikiTotal > 0 ? Math.round(wikiDone / wikiTotal * 100) : 0} color="bg-emerald-500" />
+              </div>
+            )}
+            {wikiStatus === 'done' && (
+              <p className="text-xs text-emerald-400">&#10003; Done — {wikiDone} species updated</p>
+            )}
+            {wikiStatus === 'stopped' && (
+              <p className="text-xs text-slate-400">Stopped at {wikiDone} / {wikiTotal}</p>
+            )}
+          </div>
         </div>
       );
     }
@@ -578,18 +657,32 @@
 
     // ── Wiki Modal ───────────────────────────────────────────────────
     function WikiModal({ species, commonName, onClose }) {
-      const [data, setData]     = useState(null);
-      const [imgErr, setImgErr] = useState(false);
+      const [data, setData]         = useState(null);
+      const [imgErr, setImgErr]     = useState(false);
+      const [refreshing, setRefreshing] = useState(false);
 
-      useEffect(() => {
-        if (!species) return;
+      const loadWiki = useCallback((key) => {
         setData(null); setImgErr(false);
-        const key = species.replace(/ /g, '_');
         fetch(`/wiki_data/${key}`)
           .then(r => r.ok ? r.json() : null)
           .then(setData)
           .catch(() => setData(null));
+      }, []);
+
+      useEffect(() => {
+        if (!species) return;
+        loadWiki(species.replace(/ /g, '_'));
       }, [species]);
+
+      const handleRefresh = () => {
+        const key = species.replace(/ /g, '_');
+        setRefreshing(true);
+        fetch(`/wiki_refresh/${key}`, { method: 'POST' })
+          .then(r => r.ok ? r.json() : null)
+          .then(d => { setData(d); setImgErr(false); })
+          .catch(() => loadWiki(key))
+          .finally(() => setRefreshing(false));
+      };
 
       if (!species) return null;
       const imgSrc = `/wiki_img/${species.replace(/ /g, '_')}`;
@@ -610,8 +703,18 @@
                   <p className="text-xs text-slate-500 mt-0.5">{data.description}</p>
                 )}
               </div>
-              <button onClick={onClose}
-                className="text-slate-500 hover:text-white text-xl leading-none ml-4 shrink-0">&times;</button>
+              <div className="flex items-center gap-2 ml-4 shrink-0">
+                <button onClick={handleRefresh} disabled={refreshing}
+                  title="Re-download wiki info"
+                  className="text-slate-500 hover:text-emerald-400 disabled:opacity-40 transition text-base leading-none"
+                  style={{ fontSize: '1rem' }}>
+                  {refreshing ? (
+                    <span className="inline-block w-4 h-4 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin align-middle" />
+                  ) : '\u21bb'}
+                </button>
+                <button onClick={onClose}
+                  className="text-slate-500 hover:text-white text-xl leading-none">&times;</button>
+              </div>
             </div>
 
             {/* Thumbnail */}
@@ -644,7 +747,22 @@
                     Mass: {facts.mass}
                   </span>
                 )}
+                {facts.speed && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-cyan-950/60 text-cyan-300 border border-cyan-500/20">
+                    Speed: {facts.speed}
+                  </span>
+                )}
+                {facts.lifespan && (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-teal-950/60 text-teal-300 border border-teal-500/20">
+                    Lifespan: {facts.lifespan}
+                  </span>
+                )}
               </div>
+            )}
+            {facts && facts.habitat && (
+              <p className="text-xs text-slate-400 mb-3 leading-relaxed capitalize">
+                <span className="text-slate-500 mr-1">&#127758;</span>{facts.habitat}
+              </p>
             )}
 
             {/* Article text */}
@@ -822,7 +940,11 @@
         // Restore state from server on first load
         fetch('/status')
           .then(r => r.json())
-          .then(({ train, download }) => {
+          .then(({ train, download, wiki_refresh }) => {
+            // Restore wiki refresh state
+            if (wiki_refresh && wiki_refresh.status !== 'idle') {
+              window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'wiki_refresh_all', ...wiki_refresh } }));
+            }
             // Replay training state
             if (train.device) {
               window.dispatchEvent(new CustomEvent('ws_message', { detail: { type: 'train_info', device: train.device, device_name: train.device_name } }));

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import time
 import requests
 from html.parser import HTMLParser
 from pyinaturalist import get_observation_species_counts, get_observations
@@ -121,6 +122,34 @@ def _extract_facts(text: str, title: str = "") -> dict:
         [r"weigh", r"weight", r"mass"],
         [r"kg\b", r"g\b", r"lb\b", r"lbs\b", r"pound", r"oz\b"],
     )
+    speed = _find(
+        [r"speed", r"speeds?", r"run(?:ning)?\b", r"swim(?:ming)?\b", r"fly(?:ing)?\b",
+         r"travel(?:ling)?\b", r"reach(?:ing)?\b", r"capable of", r"up to"],
+        [r"km/h", r"mph", r"m/s", r"kph", r"knots?"],
+    )
+    lifespan = _find(
+        [r"lifespan", r"life\s*span", r"live(?:s)?\b", r"live(?:s)? (?:up to|for|about)",
+         r"longevity", r"maximum age", r"lives? to"],
+        [r"years?", r"months?"],
+    )
+
+    # ── Habitat / Location ─────────────────────────────────────────────
+    habitat = None
+    _hab_m = re.search(
+        r'(?:found in|native to|endemic to|inhabits?\b|lives? in|occurs? in'
+        r'|distributed (?:across|throughout|in)|ranges? (?:from|across|throughout|over)'
+        r'|common(?:ly)? (?:found|seen) in|widespread (?:across|throughout|in))'
+        r'[^.;]{0,120}',
+        t
+    )
+    if _hab_m:
+        phrase = _hab_m.group(0).strip()
+        # Trim at the first conjunction to keep it brief
+        for _sep in [', and ', ' and ', ', but ', '; ']:
+            _idx = phrase.find(_sep, 20)
+            if _idx != -1:
+                phrase = phrase[:_idx]
+        habitat = phrase[:90].strip().rstrip(',').strip()
 
     # ── Carnivore ─────────────────────────────────────────────────────
     carnivore = bool(re.search(
@@ -152,47 +181,66 @@ def _extract_facts(text: str, title: str = "") -> dict:
 
     return {"venomous": venomous, "poisonous": poisonous, "dangerous": dangerous,
             "carnivore": carnivore, "predator": predator,
-            "size": size, "mass": mass}
+            "size": size, "mass": mass,
+            "speed": speed, "lifespan": lifespan, "habitat": habitat}
 
 
-def _fetch_wiki(name: str, wiki_dir: str) -> None:
-    """Fetch Wikipedia intro + thumbnail for a species; save to wiki_dir.
+def _fetch_wiki(name: str, wiki_dir: str, force: bool = False) -> None:
+    """Fetch Wikipedia article + thumbnail for a species; save to wiki_dir.
 
     name  – underscore form, e.g. 'Homo_sapiens'
+    force – if True, overwrite existing json (used by refresh)
     Files written:
       wiki/{name}.json    – title, description, extract_html, has_image, facts
       wiki/img/{name}.jpg – thumbnail (if available)
-    Skipped if json already exists.
+    Skipped if json already exists and force is False.
     """
     img_dir   = os.path.join(wiki_dir, "img")
     json_file = os.path.join(wiki_dir, f"{name}.json")
     img_file  = os.path.join(img_dir,  f"{name}.jpg")
 
-    if os.path.exists(json_file):
+    if os.path.exists(json_file) and not force:
         return
 
     os.makedirs(img_dir, exist_ok=True)
 
     latin = name.replace("_", " ")
-    try:
-        resp = requests.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={
-                "action":      "query",
-                "titles":      latin,
-                "prop":        "extracts|pageimages",
-                "exintro":     "1",
-                "piprop":      "thumbnail",
-                "pithumbsize": "500",
-                "format":      "json",
-                "redirects":   "1",
-            },
-            timeout=10,
-            headers={"User-Agent": "NatiDex/1.0 (species identifier)"},
-        )
-        resp.raise_for_status()
+    data = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action":      "query",
+                    "titles":      latin,
+                    "prop":        "extracts|pageimages",
+                    "exintro":     "1",
+                    "piprop":      "thumbnail",
+                    "pithumbsize": "500",
+                    "format":      "json",
+                    "redirects":   "1",
+                },
+                timeout=5,
+                headers={"User-Agent": "NatiDex/1.0 (species identifier)"},
+            )
+        except Exception as e:
+            print(f"[wiki] {name} attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))  # 10s, 20s
+            continue
+        if resp.status_code == 429:
+            wait = min(int(resp.headers.get("Retry-After", 5)), 20)
+            print(f"[wiki] {name} rate-limited — waiting {wait}s")
+            time.sleep(wait)
+            continue
+        if not resp.ok:
+            print(f"[wiki] {name} attempt {attempt+1} failed: HTTP {resp.status_code}")
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))
+            continue
         data = resp.json()
-    except Exception:
+        break
+    if data is None:
         return
 
     pages = data.get("query", {}).get("pages", {})
@@ -320,6 +368,7 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
 
         # Fetch Wikipedia data (skipped if files already exist)
         _fetch_wiki(name, "wiki")
+        time.sleep(1.5)  # polite delay — Wikipedia rate-limits aggressive clients
 
         # Skip species that already have enough photos
         if existing >= photos_per_species:

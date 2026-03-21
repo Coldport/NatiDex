@@ -4,6 +4,7 @@ import re
 import sys
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 
 
@@ -17,14 +18,45 @@ from pydantic import BaseModel
 import uvicorn
 
 from LIB.train import TrainingController
-from LIB.downloader import DownloadController, _extract_facts, _TextExtractor
+from LIB.downloader import DownloadController, _extract_facts, _TextExtractor, _fetch_wiki
 from LIB.infer import predict
+import LIB.infer as _infer
 
 _connected: set[WebSocket] = set()
 _loop: asyncio.AbstractEventLoop | None = None
 
 trainer = TrainingController()
 downloader = DownloadController()
+
+# ── Wiki refresh-all controller ──────────────────────────────────────
+_wiki_refresh_running = False
+_wiki_refresh_stop   = threading.Event()
+
+
+def _run_wiki_refresh_all(data_dir: str, wiki_dir: str):
+    global _wiki_refresh_running
+    _wiki_refresh_stop.clear()
+    _wiki_refresh_running = True
+    try:
+        if not os.path.isdir(data_dir):
+            sync_broadcast({"type": "wiki_refresh_all", "status": "done", "done": 0, "total": 0})
+            return
+        species_dirs = [d for d in os.listdir(data_dir)
+                        if os.path.isdir(os.path.join(data_dir, d))]
+        total = len(species_dirs)
+        sync_broadcast({"type": "wiki_refresh_all", "status": "running", "done": 0, "total": total})
+        for idx, name in enumerate(species_dirs):
+            if _wiki_refresh_stop.is_set():
+                break
+            _fetch_wiki(name, wiki_dir, force=True)
+            sync_broadcast({"type": "wiki_refresh_all", "status": "running",
+                            "done": idx + 1, "total": total, "current": name})
+            time.sleep(1.5)  # polite delay between Wikipedia requests
+        status = "stopped" if _wiki_refresh_stop.is_set() else "done"
+        sync_broadcast({"type": "wiki_refresh_all", "status": status,
+                        "done": idx + 1 if species_dirs else 0, "total": total})
+    finally:
+        _wiki_refresh_running = False
 
 # ── Server-side state (survives page refresh) ────────────────────────
 _state = {
@@ -37,6 +69,7 @@ _state = {
         "val_loss": None, "val_accuracy": None,
         "history": [],          # list of train_metrics dicts
         "device": None, "device_name": None,
+        "cpu": None, "gpu": None,
     },
     "download": {
         "status": "idle",
@@ -46,12 +79,22 @@ _state = {
         "active_idx": None,
         "species": [],          # [{name, pct, downloaded, total, done, skipped}]
     },
+    "wiki_refresh": {
+        "status": "idle",   # idle | running | done | stopped
+        "done": 0,
+        "total": 0,
+        "current": "",
+    },
 }
 
 def _update_state(data: dict):
     t = data.get("type", "")
 
-    if t == "train_info":
+    if t == "hw_stats":
+        _state["train"]["cpu"] = data.get("cpu")
+        _state["train"]["gpu"] = data.get("gpu")
+
+    elif t == "train_info":
         _state["train"]["device"]      = data.get("device")
         _state["train"]["device_name"] = data.get("device_name")
 
@@ -63,6 +106,8 @@ def _update_state(data: dict):
 
     elif t == "train_status":
         _state["train"]["status"] = data["status"]
+        if data["status"] == "done":
+            _infer._model = None  # force reload on next inference
         if "phase" in data:
             _state["train"]["phase"] = data["phase"]
 
@@ -102,6 +147,14 @@ def _update_state(data: dict):
         _state["download"]["status"] = data["status"]
         if data["status"] in ("stopped", "done"):
             _state["download"]["active_idx"] = None
+
+    elif t == "wiki_refresh_all":
+        _state["wiki_refresh"].update({
+            "status":  data["status"],
+            "done":    data.get("done", 0),
+            "total":   data.get("total", 0),
+            "current": data.get("current", ""),
+        })
 
 
 # ── WebSocket broadcast ──────────────────────────────────────────────
@@ -226,6 +279,20 @@ async def infer(file: UploadFile = File(...), top_k: int = 5):
 
 _SAFE_SPECIES = re.compile(r'^[A-Za-z0-9_]+$')
 
+@app.post("/wiki_refresh_all/start")
+async def wiki_refresh_all_start():
+    global _wiki_refresh_running
+    if _wiki_refresh_running:
+        return {"status": "already_running"}
+    threading.Thread(target=_run_wiki_refresh_all, args=("data", "wiki"), daemon=True).start()
+    return {"status": "started"}
+
+
+@app.post("/wiki_refresh_all/stop")
+async def wiki_refresh_all_stop():
+    _wiki_refresh_stop.set()
+    return {"status": "stopping"}
+
 @app.get("/wiki_data/{species}")
 async def wiki_data(species: str):
     if not _SAFE_SPECIES.match(species):
@@ -235,16 +302,31 @@ async def wiki_data(species: str):
         raise HTTPException(status_code=404, detail="Wiki data not available offline")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    # Re-extract facts for files saved before this feature, or with the old
-    # narrow patterns — runs in-memory, does not modify the file on disk.
-    if data.get("extract_html") and (
-        "facts" not in data
-        or not any(data["facts"].get(k) for k in ("venomous", "poisonous", "dangerous"))
-    ):
+    # Always re-extract facts in-memory so new fields (speed, lifespan, habitat, etc.)
+    # are available even for wiki files downloaded before those fields were added.
+    if data.get("extract_html"):
         parser = _TextExtractor()
         parser.feed(data["extract_html"])
         data["facts"] = _extract_facts(parser.get_text(),
                                        title=f"{data.get('title', '')} {species}")
+    return data
+
+
+@app.post("/wiki_refresh/{species}")
+async def wiki_refresh(species: str):
+    if not _SAFE_SPECIES.match(species):
+        raise HTTPException(status_code=400, detail="Invalid species name")
+    json_path = os.path.join("wiki", f"{species}.json")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: _fetch_wiki(species, "wiki", force=True))
+    if not os.path.isfile(json_path):
+        raise HTTPException(status_code=404, detail="Failed to fetch wiki data — species may not have a Wikipedia article")
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("extract_html"):
+        parser = _TextExtractor()
+        parser.feed(data["extract_html"])
+        data["facts"] = _extract_facts(parser.get_text(), title=f"{data.get('title', '')} {species}")
     return data
 
 
