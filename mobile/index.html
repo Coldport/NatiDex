@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>NatiDex</title>
+
+  <!-- onnxruntime-web: loaded from node_modules after npm install -->
+  <!-- If running in browser for testing, swap this for the CDN URL:
+       https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.min.js -->
+  <script src="node_modules/onnxruntime-web/dist/ort.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #09090b;
+      --surface:  rgba(255,255,255,0.04);
+      --border:   rgba(255,255,255,0.08);
+      --text:     #f4f4f5;
+      --muted:    #71717a;
+      --green:    #34d399;
+      --green-bg: rgba(52,211,153,0.12);
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bot: env(safe-area-inset-bottom, 0px);
+    }
+
+    html, body {
+      height: 100%; background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      overflow: hidden;
+    }
+
+    /* ── Splash ──────────────────────────────────────────────────── */
+    #splash {
+      position: fixed; inset: 0; background: var(--bg);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 20px;
+      z-index: 100;
+    }
+    #splash h1 { font-size: 2rem; font-weight: 800; letter-spacing: -1px; }
+    #splash h1 span { color: var(--green); }
+    #splash-status { font-size: 0.8rem; color: var(--muted); }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid rgba(52,211,153,0.2);
+      border-top-color: var(--green);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Main layout ─────────────────────────────────────────────── */
+    #main {
+      display: none; flex-direction: column; height: 100%;
+      padding-top: var(--safe-top);
+      padding-bottom: var(--safe-bot);
+    }
+
+    /* header */
+    .app-header {
+      padding: 14px 20px 10px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .app-header h1 { font-size: 1.1rem; font-weight: 700; }
+    .app-header h1 span { color: var(--green); }
+
+    /* scrollable content */
+    .content { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+
+    /* ── Camera zone ─────────────────────────────────────────────── */
+    .camera-zone {
+      border: 2px dashed var(--border);
+      border-radius: 20px;
+      min-height: 220px;
+      display: flex; align-items: center; justify-content: center;
+      position: relative; overflow: hidden;
+      background: var(--surface);
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .camera-zone:active { border-color: var(--green); }
+    .camera-zone img#preview {
+      position: absolute; inset: 0;
+      width: 100%; height: 100%; object-fit: cover;
+    }
+    .camera-placeholder {
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      color: var(--muted); user-select: none; pointer-events: none;
+    }
+    .camera-placeholder svg { width: 48px; height: 48px; opacity: 0.4; }
+    .camera-placeholder p { font-size: 0.85rem; }
+    .camera-overlay {
+      position: absolute; inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: flex; align-items: center; justify-content: center;
+      display: none;
+    }
+    .camera-overlay.active { display: flex; }
+
+    /* ── Capture button ──────────────────────────────────────────── */
+    .btn-capture {
+      width: 100%; padding: 15px;
+      background: var(--green); color: #000;
+      font-weight: 700; font-size: 0.95rem;
+      border: none; border-radius: 16px;
+      cursor: pointer; transition: opacity 0.15s;
+    }
+    .btn-capture:active { opacity: 0.8; }
+    .btn-capture:disabled { opacity: 0.35; cursor: default; }
+
+    /* ── Results ─────────────────────────────────────────────────── */
+    .results-section h2 { font-size: 0.75rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+    .result-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 14px 16px; margin-bottom: 10px;
+      cursor: pointer; transition: border-color 0.15s;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .result-card:active { border-color: var(--green); }
+    .result-card.top { border-color: rgba(52,211,153,0.35); background: var(--green-bg); }
+    .result-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .result-names { flex: 1; }
+    .result-common { font-size: 0.95rem; font-weight: 600; }
+    .result-species { font-size: 0.78rem; color: var(--muted); font-style: italic; margin-top: 1px; }
+    .result-conf { font-size: 0.9rem; font-weight: 700; color: var(--green); white-space: nowrap; }
+    .result-bar-bg { height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; }
+    .result-bar { height: 4px; border-radius: 2px; background: var(--green); transition: width 0.4s ease; }
+    .result-card:not(.top) .result-bar { background: #52525b; }
+
+    .error-box {
+      background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.25);
+      border-radius: 14px; padding: 14px; font-size: 0.85rem; color: #f87171;
+    }
+
+    /* ── Wiki Modal ──────────────────────────────────────────────── */
+    #wiki-backdrop {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.75); z-index: 50;
+      align-items: flex-end; justify-content: center;
+    }
+    #wiki-backdrop.open { display: flex; }
+    #wiki-sheet {
+      background: #18181b; border-radius: 24px 24px 0 0;
+      width: 100%; max-height: 88vh;
+      overflow-y: auto; padding: 20px 20px calc(20px + var(--safe-bot));
+      display: flex; flex-direction: column; gap: 14px;
+    }
+    .wiki-handle { width: 40px; height: 4px; background: #3f3f46; border-radius: 2px; margin: 0 auto 4px; }
+    .wiki-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .wiki-header-text h3 { font-size: 1.1rem; font-weight: 700; }
+    .wiki-header-text p  { font-size: 0.82rem; color: var(--muted); font-style: italic; margin-top: 2px; }
+    .wiki-close {
+      background: none; border: none; color: var(--muted);
+      font-size: 1.4rem; line-height: 1; cursor: pointer; padding: 4px;
+    }
+    .wiki-img { width: 100%; max-height: 220px; object-fit: cover; border-radius: 16px; }
+    .wiki-badges { display: flex; flex-wrap: wrap; gap: 8px; }
+    .badge {
+      padding: 4px 12px; border-radius: 999px;
+      font-size: 0.72rem; font-weight: 600; border: 1px solid transparent;
+    }
+    .badge-red    { background: rgba(127,29,29,0.5);  color: #fca5a5; border-color: rgba(239,68,68,0.2); }
+    .badge-orange { background: rgba(124,45,18,0.5);  color: #fdba74; border-color: rgba(249,115,22,0.2); }
+    .badge-amber  { background: rgba(120,53,15,0.5);  color: #fcd34d; border-color: rgba(245,158,11,0.2); }
+    .badge-violet { background: rgba(76,29,149,0.5);  color: #c4b5fd; border-color: rgba(139,92,246,0.2); }
+    .badge-rose   { background: rgba(136,19,55,0.5);  color: #fda4af; border-color: rgba(244,63,94,0.2); }
+    .badge-green  { background: rgba(6,78,59,0.5);    color: #6ee7b7; border-color: rgba(16,185,129,0.2); }
+    .badge-blue   { background: rgba(23,37,84,0.5);   color: #93c5fd; border-color: rgba(59,130,246,0.2); }
+    .badge-slate  { background: rgba(30,41,59,0.5);   color: #cbd5e1; border-color: rgba(255,255,255,0.1); }
+    .badge-cyan   { background: rgba(22,78,99,0.5);   color: #67e8f9; border-color: rgba(6,182,212,0.2); }
+    .badge-teal   { background: rgba(19,78,74,0.5);   color: #5eead4; border-color: rgba(20,184,166,0.2); }
+    .wiki-habitat { font-size: 0.8rem; color: #a1a1aa; line-height: 1.5; text-transform: capitalize; }
+    .wiki-extract { font-size: 0.85rem; color: #d4d4d8; line-height: 1.65; }
+    .wiki-extract p { margin-bottom: 0.7em; }
+    .wiki-extract p:last-child { margin-bottom: 0; }
+    .wiki-extract h2, .wiki-extract h3 { font-size: 0.9rem; font-weight: 700; margin: 1em 0 0.4em; color: var(--text); }
+    .wiki-loading { color: var(--muted); font-size: 0.85rem; text-align: center; padding: 20px 0; }
+  </style>
+</head>
+<body>
+
+<!-- ── Splash screen ──────────────────────────────────────────────── -->
+<div id="splash">
+  <h1>Nati<span>Dex</span></h1>
+  <div class="spinner"></div>
+  <p id="splash-status">Loading model…</p>
+</div>
+
+<!-- ── Main app ───────────────────────────────────────────────────── -->
+<div id="main">
+  <header class="app-header">
+    <h1>Nati<span>Dex</span></h1>
+    <span style="font-size:0.72rem;color:var(--muted);font-family:monospace;">on-device AI</span>
+  </header>
+
+  <div class="content">
+
+    <!-- Camera zone -->
+    <div class="camera-zone" id="camera-zone" onclick="handleCameraZoneClick()">
+      <img id="preview" src="" alt="preview" style="display:none;" />
+      <div class="camera-placeholder" id="placeholder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M6.827 6.175A2.31 2.31 0 015.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 00-1.134-.175 2.31 2.31 0 01-1.64-1.055l-.822-1.316a2.192 2.192 0 00-1.736-1.039 48.774 48.774 0 00-5.232 0 2.192 2.192 0 00-1.736 1.039l-.821 1.316z" />
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM18.75 10.5h.008v.008h-.008V10.5z" />
+        </svg>
+        <p>Tap to identify a species</p>
+      </div>
+      <div class="camera-overlay" id="infer-overlay">
+        <div class="spinner"></div>
+      </div>
+    </div>
+
+    <!-- hidden file input fallback for non-Capacitor (browser testing) -->
+    <input type="file" id="file-input" accept="image/*" style="display:none"
+           onchange="handleFileInput(this)" />
+
+    <!-- Capture button -->
+    <button class="btn-capture" id="btn-capture" onclick="openCamera()">
+      📷 &nbsp;Take Photo or Choose from Gallery
+    </button>
+
+    <!-- Error -->
+    <div class="error-box" id="error-box" style="display:none;"></div>
+
+    <!-- Results -->
+    <div class="results-section" id="results-section" style="display:none;">
+      <h2>Top Matches</h2>
+      <div id="results-list"></div>
+    </div>
+
+  </div><!-- .content -->
+</div><!-- #main -->
+
+<!-- ── Wiki / Species detail modal ───────────────────────────────── -->
+<div id="wiki-backdrop" onclick="closeWiki(event)">
+  <div id="wiki-sheet">
+    <div class="wiki-handle"></div>
+    <div class="wiki-header">
+      <div class="wiki-header-text">
+        <h3 id="wiki-title"></h3>
+        <p  id="wiki-species"></p>
+      </div>
+      <button class="wiki-close" onclick="closeWiki()">&times;</button>
+    </div>
+    <div id="wiki-body">
+      <p class="wiki-loading">Loading…</p>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── Config ────────────────────────────────────────────────────────────
+const MEAN = [0.485, 0.456, 0.406];
+const STD  = [0.229, 0.224, 0.225];
+const MODEL_PATH        = 'assets/model.onnx';
+const CLASS_LABELS_PATH = 'assets/class_labels.json';
+const COMMON_NAMES_PATH = 'assets/common_names.json';
+
+// ── State ─────────────────────────────────────────────────────────────
+let session     = null;
+let classLabels = {};   // {"0": "Acanthis_flammea", ...}
+let commonNames = {};   // {"Acanthis_flammea": "Common Redpoll", ...}
+let isCapacitor = false;
+
+// ── Boot ──────────────────────────────────────────────────────────────
+window.addEventListener('load', boot);
+
+async function boot() {
+  isCapacitor = !!(window.Capacitor && window.Capacitor.isNativePlatform &&
+                   window.Capacitor.isNativePlatform());
+
+  setSplashStatus('Loading species data…');
+  try {
+    const [labelsResp, namesResp] = await Promise.all([
+      fetch(CLASS_LABELS_PATH),
+      fetch(COMMON_NAMES_PATH),
+    ]);
+    classLabels = await labelsResp.json();
+    commonNames = await namesResp.json();
+  } catch (e) {
+    setSplashStatus('ERROR: Could not load class_labels.json / common_names.json');
+    console.error(e);
+    return;
+  }
+
+  setSplashStatus('Loading AI model…');
+  try {
+    // Point WASM files at node_modules (bundled by Capacitor sync)
+    ort.env.wasm.numThreads = 1;   // avoid SharedArrayBuffer requirement
+    ort.env.wasm.simd       = true;
+    ort.env.wasm.wasmPaths  = 'node_modules/onnxruntime-web/dist/';
+
+    session = await ort.InferenceSession.create(MODEL_PATH, {
+      executionProviders: ['wasm'],
+    });
+  } catch (e) {
+    setSplashStatus('ERROR: Could not load model.onnx — run export_onnx.py first');
+    console.error(e);
+    return;
+  }
+
+  // Show app
+  document.getElementById('splash').style.display = 'none';
+  document.getElementById('main').style.display   = 'flex';
+}
+
+function setSplashStatus(msg) {
+  document.getElementById('splash-status').textContent = msg;
+}
+
+// ── Camera / image input ──────────────────────────────────────────────
+function handleCameraZoneClick() {
+  if (!session) return;
+  openCamera();
+}
+
+async function openCamera() {
+  setError(null);
+
+  if (isCapacitor) {
+    // Capacitor Camera plugin
+    try {
+      const { Camera } = window.Capacitor.Plugins;
+      const photo = await Camera.getPhoto({
+        quality:      90,
+        allowEditing: false,
+        resultType:   'base64',  // base64 string — easiest for canvas
+        source:       'PROMPT',  // let user pick Camera or Photos
+        width:        800,
+        height:       800,
+      });
+      const img = new Image();
+      img.onload = () => processImage(img);
+      img.src = `data:image/jpeg;base64,${photo.base64String}`;
+    } catch (err) {
+      if (err && err.message && !err.message.includes('cancelled')) {
+        setError('Camera error: ' + err.message);
+      }
+    }
+  } else {
+    // Browser fallback — file picker
+    document.getElementById('file-input').click();
+  }
+}
+
+function handleFileInput(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => processImage(img);
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+  input.value = '';
+}
+
+// ── Inference pipeline ────────────────────────────────────────────────
+async function processImage(imgElement) {
+  // Show preview
+  const previewEl = document.getElementById('preview');
+  previewEl.src   = imgElement.src;
+  previewEl.style.display = 'block';
+  document.getElementById('placeholder').style.display = 'none';
+
+  // Show spinner overlay
+  document.getElementById('infer-overlay').classList.add('active');
+  document.getElementById('btn-capture').disabled = true;
+  document.getElementById('results-section').style.display = 'none';
+  setError(null);
+
+  try {
+    const tensor = preprocessImage(imgElement);
+    const out    = await session.run({ input: tensor });
+    const logits = Array.from(out['output'].data);  // Float32Array → Array
+
+    // Softmax
+    const maxLogit = Math.max(...logits);
+    const exps     = logits.map(v => Math.exp(v - maxLogit));
+    const sumExp   = exps.reduce((a, b) => a + b, 0);
+    const probs    = exps.map(v => v / sumExp);
+
+    // Top-5
+    const top5 = probs
+      .map((p, i) => ({ idx: i, prob: p }))
+      .sort((a, b) => b.prob - a.prob)
+      .slice(0, 5);
+
+    renderResults(top5);
+  } catch (e) {
+    setError('Inference failed: ' + e.message);
+    console.error(e);
+  } finally {
+    document.getElementById('infer-overlay').classList.remove('active');
+    document.getElementById('btn-capture').disabled = false;
+  }
+}
+
+function preprocessImage(imgElement) {
+  // Replicate LIB/infer.py exactly:
+  //   Resize(224, 224) → ToTensor (÷255) → Normalize(mean, std)
+  //   Output shape: [1, C, H, W] = [1, 3, 224, 224] in CHW layout
+  const SIZE = 224;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SIZE;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(imgElement, 0, 0, SIZE, SIZE);
+
+  const { data } = ctx.getImageData(0, 0, SIZE, SIZE);  // RGBA, Uint8ClampedArray
+  const nPx    = SIZE * SIZE;
+  const float32 = new Float32Array(3 * nPx);
+
+  for (let i = 0; i < nPx; i++) {
+    const r = data[i * 4]     / 255.0;
+    const g = data[i * 4 + 1] / 255.0;
+    const b = data[i * 4 + 2] / 255.0;
+    float32[0 * nPx + i] = (r - MEAN[0]) / STD[0];
+    float32[1 * nPx + i] = (g - MEAN[1]) / STD[1];
+    float32[2 * nPx + i] = (b - MEAN[2]) / STD[2];
+  }
+
+  return new ort.Tensor('float32', float32, [1, 3, SIZE, SIZE]);
+}
+
+// ── Results rendering ─────────────────────────────────────────────────
+function renderResults(top5) {
+  const list    = document.getElementById('results-list');
+  const section = document.getElementById('results-section');
+  list.innerHTML = '';
+
+  const maxConf = top5[0].prob;
+
+  top5.forEach((item, rank) => {
+    const speciesKey  = classLabels[String(item.idx)] || '';
+    const speciesName = speciesKey.replace(/_/g, ' ');
+    const commonName  = commonNames[speciesKey] || speciesName;
+    const pct         = (item.prob * 100).toFixed(1);
+    const barW        = maxConf > 0 ? (item.prob / maxConf * 100).toFixed(1) : 0;
+
+    const card = document.createElement('div');
+    card.className = 'result-card' + (rank === 0 ? ' top' : '');
+    card.innerHTML = `
+      <div class="result-card-header">
+        <div class="result-names">
+          <div class="result-common">${esc(commonName)}</div>
+          <div class="result-species">${esc(speciesName)}</div>
+        </div>
+        <div class="result-conf">${pct}%</div>
+      </div>
+      <div class="result-bar-bg">
+        <div class="result-bar" style="width:${barW}%"></div>
+      </div>
+    `;
+    card.addEventListener('click', () => openWiki(speciesKey, commonName, speciesName));
+    list.appendChild(card);
+  });
+
+  section.style.display = 'block';
+  section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// ── Wiki modal ────────────────────────────────────────────────────────
+function openWiki(speciesKey, commonName, speciesName) {
+  document.getElementById('wiki-title').textContent   = commonName || speciesName;
+  document.getElementById('wiki-species').textContent = speciesName;
+  document.getElementById('wiki-body').innerHTML      = '<p class="wiki-loading">Loading…</p>';
+  document.getElementById('wiki-backdrop').classList.add('open');
+  loadWikiData(speciesKey);
+}
+
+function closeWiki(e) {
+  if (e && e.target !== document.getElementById('wiki-backdrop')) return;
+  document.getElementById('wiki-backdrop').classList.remove('open');
+}
+
+async function loadWikiData(speciesKey) {
+  const body = document.getElementById('wiki-body');
+  try {
+    const resp = await fetch(`assets/wiki/${speciesKey}.json`);
+    if (!resp.ok) throw new Error('not found');
+    const data = await resp.json();
+    renderWiki(body, speciesKey, data);
+  } catch {
+    body.innerHTML = '<p class="wiki-loading" style="color:#71717a">No offline data available for this species.</p>';
+  }
+}
+
+function renderWiki(container, speciesKey, data) {
+  const facts = data.facts || {};
+  let html = '';
+
+  // Thumbnail
+  if (data.has_image) {
+    html += `<img class="wiki-img" src="assets/wiki/img/${speciesKey}.jpg"
+               alt="${esc(data.title || '')}"
+               onerror="this.style.display='none'" />`;
+  }
+
+  // Fact badges
+  const badges = [];
+  if (facts.venomous)  badges.push(['Venomous',          'badge-red']);
+  if (facts.poisonous) badges.push(['Poisonous',         'badge-orange']);
+  if (facts.dangerous && !facts.venomous && !facts.poisonous)
+                       badges.push(['Dangerous',         'badge-amber']);
+  if (facts.predator)  badges.push(['Predator',          'badge-violet']);
+  if (facts.carnivore && !facts.predator)
+                       badges.push(['Carnivore',         'badge-rose']);
+  if (!facts.venomous && !facts.poisonous && !facts.dangerous &&
+      !facts.predator && !facts.carnivore)
+                       badges.push(['Generally harmless','badge-green']);
+  if (facts.size)      badges.push(['Size: ' + facts.size,     'badge-blue']);
+  if (facts.mass)      badges.push(['Mass: ' + facts.mass,     'badge-slate']);
+  if (facts.speed)     badges.push(['Speed: ' + facts.speed,   'badge-cyan']);
+  if (facts.lifespan)  badges.push(['Lifespan: ' + facts.lifespan, 'badge-teal']);
+
+  if (badges.length) {
+    html += '<div class="wiki-badges">';
+    badges.forEach(([label, cls]) => {
+      html += `<span class="badge ${cls}">${esc(label)}</span>`;
+    });
+    html += '</div>';
+  }
+
+  // Habitat
+  if (facts.habitat) {
+    html += `<p class="wiki-habitat">🌍 ${esc(facts.habitat)}</p>`;
+  }
+
+  // Article text
+  if (data.extract_html) {
+    html += `<div class="wiki-extract">${data.extract_html}</div>`;
+  } else if (data.description) {
+    html += `<p class="wiki-extract">${esc(data.description)}</p>`;
+  }
+
+  container.innerHTML = html;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+function setError(msg) {
+  const box = document.getElementById('error-box');
+  if (msg) { box.textContent = msg; box.style.display = 'block'; }
+  else      { box.style.display = 'none'; }
+}
+
+function esc(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

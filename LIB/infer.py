@@ -14,18 +14,35 @@ _model  = None
 _labels: dict[str, str] = {}
 _common: dict[str, str] = {}
 
+_IMG_SIZE = 320
+
 _preprocess = T.Compose([
-    T.Resize((224, 224)),
+    T.Resize((_IMG_SIZE, _IMG_SIZE)),
     T.ToTensor(),
     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
 
 def _build_model(num_classes: int) -> nn.Module:
-    m = torchvision.models.mobilenet_v2(weights=None)
+    """Must match the architecture used in train.py exactly."""
+    m = torchvision.models.efficientnet_b4(weights=None)
+    in_features = m.classifier[1].in_features  # 1792
+
     m.classifier = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(m.last_channel, num_classes),
+        nn.Dropout(0.4),
+        nn.Linear(in_features, 1024),
+        nn.BatchNorm1d(1024),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.35),
+        nn.Linear(1024, 512),
+        nn.BatchNorm1d(512),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.25),
+        nn.Linear(512, 256),
+        nn.BatchNorm1d(256),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.15),
+        nn.Linear(256, num_classes),
     )
     return m
 
@@ -52,7 +69,7 @@ def _load():
     with open("class_labels.json") as f:
         _labels = json.load(f)
 
-    m.to(device).eval()
+    m.to(device, memory_format=torch.channels_last).eval()
     _model = m
 
     try:
@@ -70,7 +87,7 @@ def predict(image_bytes: bytes, top_k: int = 5) -> list[dict]:
     _load()
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    x   = _preprocess(img).unsqueeze(0).to(device)
+    x   = _preprocess(img).unsqueeze(0).to(device, memory_format=torch.channels_last)
 
     with torch.no_grad(), torch.amp.autocast(device.type):
         probs = torch.softmax(_model(x), dim=1)[0].cpu().float().numpy()

@@ -10,8 +10,14 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 
-torch.backends.cudnn.benchmark = True  # optimise kernels for fixed input size
+torch.backends.cudnn.benchmark = True   # optimise kernels for fixed input size
+torch.backends.cuda.matmul.allow_tf32 = True  # TF32 matmul (Ampere/Blackwell)
+torch.backends.cudnn.allow_tf32       = True  # TF32 convolutions
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Input resolution — EfficientNet-B4 was trained at 380; 320 is a good
+# balance between accuracy and VRAM / throughput.
+IMG_SIZE = 320
 
 
 class TrainingController:
@@ -57,7 +63,6 @@ def _query_gpu_util() -> int | None:
 
 def _hw_monitor(on_update, stop_event):
     """Background thread: broadcasts CPU% and GPU% every 2 s while training."""
-    # Try to initialise pynvml for real GPU utilisation % (fastest path)
     _nvml_handle = None
     try:
         import pynvml
@@ -79,7 +84,7 @@ def _hw_monitor(on_update, stop_event):
             except Exception:
                 pass
         elif device.type == "cuda":
-            gpu = _query_gpu_util()  # real compute % via nvidia-smi
+            gpu = _query_gpu_util()
 
         on_update({"type": "hw_stats", "cpu": round(cpu, 1), "gpu": gpu})
 
@@ -87,14 +92,32 @@ def _hw_monitor(on_update, stop_event):
 # ── Model factory ────────────────────────────────────────────────────
 
 def _build_model(num_classes: int) -> nn.Module:
-    m = torchvision.models.mobilenet_v2(
-        weights=torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V1
+    """EfficientNet-B4 backbone with a deep, wide 3-layer MLP head."""
+    m = torchvision.models.efficientnet_b4(
+        weights=torchvision.models.EfficientNet_B4_Weights.IMAGENET1K_V1
     )
+    in_features = m.classifier[1].in_features  # 1792
+
     m.classifier = nn.Sequential(
-        nn.Dropout(0.3),
-        nn.Linear(m.last_channel, num_classes),
+        nn.Dropout(0.4),
+        nn.Linear(in_features, 1024),
+        nn.BatchNorm1d(1024),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.35),
+        nn.Linear(1024, 512),
+        nn.BatchNorm1d(512),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.25),
+        nn.Linear(512, 256),
+        nn.BatchNorm1d(256),
+        nn.SiLU(inplace=True),
+        nn.Dropout(0.15),
+        nn.Linear(256, num_classes),
     )
-    return m.to(device)
+    # channels_last (NHWC) layout is significantly faster on modern NVIDIA GPUs
+    # for conv-heavy models like EfficientNet.
+    m = m.to(device, memory_format=torch.channels_last)
+    return m
 
 
 # ── Single epoch (train or validate) ────────────────────────────────
@@ -116,7 +139,7 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
         if stop_event.is_set():
             return None, None
 
-        inputs = inputs.to(device, non_blocking=True)
+        inputs = inputs.to(device, non_blocking=True, memory_format=torch.channels_last)
         labels = labels.to(device, non_blocking=True)
 
         if is_train:
@@ -125,6 +148,9 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
                 out  = model(inputs)
                 loss = criterion(out, labels)
             scaler.scale(loss).backward()
+            # Gradient clipping prevents exploding gradients in the deep head
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -153,10 +179,10 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
     return total_loss / total, correct / total
 
 
-# ── One training phase with early stopping + LR-on-stall ────────────
+# ── One training phase with early stopping + cosine LR ──────────────
 
 def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
-           pause_event, stop_event, phase, max_epochs, max_lr, num_classes):
+           scheduler, pause_event, stop_event, phase, max_epochs, num_classes):
 
     use_amp = device.type == "cuda"
     scaler  = torch.amp.GradScaler(device.type, enabled=use_amp)
@@ -164,8 +190,6 @@ def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
     best_val_loss = float('inf')
     best_state    = None
     es_wait       = 0    # early-stopping counter
-    lr_wait       = 0    # LR-boost counter
-    lr_best_acc   = -1.0
 
     for epoch in range(max_epochs):
         if stop_event.is_set():
@@ -183,6 +207,9 @@ def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
         if val_loss is None:
             break
 
+        if scheduler is not None:
+            scheduler.step()
+
         on_update({
             "type":         "train_metrics",
             "phase":        phase,
@@ -198,7 +225,9 @@ def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
         improved = val_loss < best_val_loss
         if improved:
             best_val_loss = val_loss
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # unwrap compiled model for portable state dict
+            raw = getattr(model, "_orig_mod", model)
+            best_state = {k: v.cpu().clone() for k, v in raw.state_dict().items()}
             torch.save({"state_dict": best_state, "num_classes": num_classes},
                        "best_model.pth")
 
@@ -207,21 +236,11 @@ def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
             es_wait = 0
         else:
             es_wait += 1
-            if es_wait >= 5:
+            if es_wait >= 7:
                 if best_state:
-                    model.load_state_dict(best_state)
+                    raw = getattr(model, "_orig_mod", model)
+                    raw.load_state_dict(best_state)
                 break
-
-        # ── Increase LR when val_accuracy stalls ──────────────────────
-        if val_acc > lr_best_acc + 1e-4:
-            lr_best_acc = val_acc
-            lr_wait     = 0
-        else:
-            lr_wait += 1
-            if lr_wait >= 3:
-                for pg in optimizer.param_groups:
-                    pg['lr'] = min(pg['lr'] * 1.5, max_lr)
-                lr_wait = 0
 
 
 # ── Main training entry point ────────────────────────────────────────
@@ -230,14 +249,18 @@ def _train(on_update, data_dir, pause_event, stop_event):
     on_update({"type": "train_status", "status": "loading_data"})
 
     train_tf = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((IMG_SIZE, IMG_SIZE)),
         T.RandomHorizontalFlip(),
-        T.RandomRotation(15),
+        T.RandomVerticalFlip(p=0.1),
+        T.RandomRotation(20),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        T.RandomGrayscale(p=0.05),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
     ])
     val_tf = T.Compose([
-        T.Resize((224, 224)),
+        T.Resize((IMG_SIZE, IMG_SIZE)),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
@@ -252,20 +275,21 @@ def _train(on_update, data_dir, pause_event, stop_event):
     g       = torch.Generator().manual_seed(42)
     idx     = torch.randperm(n_total, generator=g).tolist()
 
-    use_cuda   = device.type == "cuda"
-    # Parallel workers keep the GPU fed; persistent_workers avoids re-spawning each epoch
-    nw = 16 if use_cuda else 0
+    use_cuda = device.type == "cuda"
+    # 8 workers is the sweet spot on Windows (spawn-based MP); 16 causes
+    # excessive context-switch overhead and kills GPU utilisation.
+    nw = 8 if use_cuda else 0
     train_loader = DataLoader(
         Subset(ds_train, idx[:n_train]),
         batch_size=256, shuffle=True,
         num_workers=nw, pin_memory=use_cuda,
-        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
+        persistent_workers=(nw > 0), prefetch_factor=(4 if nw > 0 else None),
     )
     val_loader = DataLoader(
         Subset(ds_val, idx[n_train:]),
         batch_size=256, shuffle=False,
         num_workers=nw, pin_memory=use_cuda,
-        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
+        persistent_workers=(nw > 0), prefetch_factor=(4 if nw > 0 else None),
     )
 
     num_classes = len(ds_train.classes)
@@ -285,17 +309,25 @@ def _train(on_update, data_dir, pause_event, stop_event):
         json.dump(idx_to_class, f)
 
     model     = _build_model(num_classes)
-    criterion = nn.CrossEntropyLoss()
+    # Label smoothing regularises the deep head and reduces overconfidence
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    # ── Phase 1: Train the classification head ────────────────────────
-    for param in model.features.parameters():
+    # ── Phase 1: Train the classification head only ───────────────────
+    raw = getattr(model, "_orig_mod", model)
+    for param in raw.features.parameters():
         param.requires_grad = False
 
-    optimizer = torch.optim.Adam(model.classifier.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=1e-3, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=20, T_mult=2, eta_min=1e-5
+    )
 
     on_update({"type": "train_status", "status": "training", "phase": 1})
     _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
-           pause_event, stop_event, phase=1, max_epochs=50, max_lr=1e-3,
+           scheduler, pause_event, stop_event, phase=1, max_epochs=200,
            num_classes=num_classes)
 
     if stop_event.is_set():
@@ -303,21 +335,26 @@ def _train(on_update, data_dir, pause_event, stop_event):
         on_update({"type": "train_status", "status": "stopped"})
         return
 
-    # ── Phase 2: Fine-tune the last 5 feature blocks ──────────────────
-    for param in model.features.parameters():
+    # ── Phase 2: Fine-tune last 3 feature blocks ──────────────────────
+    # EfficientNet-B4 has features[0..8]; unfreeze 6, 7, 8
+    for param in raw.features.parameters():
         param.requires_grad = True
-    for i, block in enumerate(model.features):
-        if i < 14:   # freeze first 14 of 19 blocks (~equivalent to TF's [:-30])
+    for i, block in enumerate(raw.features):
+        if i < 6:
             for param in block.parameters():
                 param.requires_grad = False
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=5e-5, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-7
     )
 
     on_update({"type": "train_status", "status": "training", "phase": 2})
     _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
-           pause_event, stop_event, phase=2, max_epochs=50, max_lr=1e-4,
+           scheduler, pause_event, stop_event, phase=2, max_epochs=60,
            num_classes=num_classes)
 
     hw_stop.set()  # stop hardware monitor
@@ -325,6 +362,7 @@ def _train(on_update, data_dir, pause_event, stop_event):
     if stop_event.is_set():
         on_update({"type": "train_status", "status": "stopped"})
     else:
-        torch.save({"state_dict": model.state_dict(), "num_classes": num_classes},
+        raw = getattr(model, "_orig_mod", model)
+        torch.save({"state_dict": raw.state_dict(), "num_classes": num_classes},
                    "species_model.pth")
         on_update({"type": "train_status", "status": "done"})

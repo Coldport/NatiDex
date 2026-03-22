@@ -284,6 +284,9 @@ def _fetch_wiki(name: str, wiki_dir: str, force: bool = False) -> None:
         pass
 
 
+_STATE_FILE = "download_state.json"
+
+
 class DownloadController:
     def __init__(self):
         self._stop = threading.Event()
@@ -304,69 +307,129 @@ class DownloadController:
             self._running = False
 
 
+def _load_state(species_limit, photos_per_species):
+    """Load saved download state if it exists and matches current params."""
+    if not os.path.exists(_STATE_FILE):
+        return None
+    try:
+        with open(_STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        if (state.get("species_limit") == species_limit and
+                state.get("photos_per_species") == photos_per_species):
+            return state
+    except Exception:
+        pass
+    return None
+
+
+def _save_state(state):
+    try:
+        with open(_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def _download(on_update, stop_event, species_limit, photos_per_species, data_dir):
     kingdoms = [1, 47126]  # Animals, Plants
     species_per_kingdom = species_limit // len(kingdoms)
 
-    # ── Step 1: Gather all species metadata (paginated, API max 500/page) ──
-    API_MAX = 500
-    all_species = []
-    for k_id in kingdoms:
-        if stop_event.is_set():
-            break
-        on_update({"type": "download_status", "status": "fetching_species", "kingdom_id": k_id})
-        page = 1
-        while len(all_species) < species_limit:
-            need = species_per_kingdom - sum(1 for s in all_species)
-            counts = get_observation_species_counts(
-                taxon_id=k_id, quality_grade='research',
-                per_page=min(API_MAX, need), page=page
-            )
-            results = counts.get('results', [])
-            if not results:
+    # ── Step 1: Load saved state OR fetch species from API ───────────
+    state = _load_state(species_limit, photos_per_species)
+
+    if state is not None:
+        all_species   = state["species"]
+        resume_from   = state.get("last_completed_idx", -1) + 1
+        on_update({
+            "type":         "download_status",
+            "status":       "resuming",
+            "from_species": resume_from,
+            "total_species": len(all_species),
+        })
+        print(f"[NatiDex] Resuming download from species #{resume_from} "
+              f"(of {len(all_species)})")
+    else:
+        # Fresh start — fetch all species metadata from iNaturalist
+        API_MAX = 500
+        all_species = []
+        for k_id in kingdoms:
+            if stop_event.is_set():
                 break
-            for record in results:
-                taxon = record['taxon']
-                all_species.append({
-                    "name":         taxon['name'].replace(" ", "_"),
-                    "display_name": taxon['name'],
-                    "id":           taxon['id'],
-                    "common_name":  taxon.get('preferred_common_name', ''),
-                })
-            if len(results) < min(API_MAX, need):
-                break  # iNaturalist has no more results for this kingdom
-            page += 1
+            on_update({"type": "download_status", "status": "fetching_species",
+                       "kingdom_id": k_id})
+            page = 1
+            while len(all_species) < species_limit:
+                need = species_per_kingdom - len(all_species)
+                counts = get_observation_species_counts(
+                    taxon_id=k_id, quality_grade='research',
+                    per_page=min(API_MAX, need), page=page
+                )
+                results = counts.get('results', [])
+                if not results:
+                    break
+                for record in results:
+                    taxon = record['taxon']
+                    all_species.append({
+                        "name":         taxon['name'].replace(" ", "_"),
+                        "display_name": taxon['name'],
+                        "id":           taxon['id'],
+                        "common_name":  taxon.get('preferred_common_name', ''),
+                    })
+                if len(results) < min(API_MAX, need):
+                    break
+                page += 1
+
+        resume_from = 0
+        # Persist species list immediately so future restarts can skip this step
+        _save_state({
+            "species_limit":       species_limit,
+            "photos_per_species":  photos_per_species,
+            "species":             all_species,
+            "last_completed_idx":  -1,
+        })
 
     total_species = len(all_species)
-    total_target = total_species * photos_per_species
+    total_target  = total_species * photos_per_species
 
-    # Save common names mapping: {"Homo_sapiens": "Human", ...}
+    # Always refresh common names mapping (cheap, instant)
     common_names = {s["name"]: s["common_name"] for s in all_species if s["common_name"]}
     with open("common_names.json", "w", encoding="utf-8") as f:
         json.dump(common_names, f, ensure_ascii=False)
 
     on_update({
-        "type": "download_init",
-        "total_species": total_species,
-        "species": [s["display_name"] for s in all_species],
+        "type":              "download_init",
+        "total_species":     total_species,
+        "species":           [s["display_name"] for s in all_species],
         "photos_per_species": photos_per_species,
+        "resuming_from":     resume_from,
     })
 
-    # ── Step 2: Download photos per species ─────────────────────────
+    # ── Compute overall_downloaded count for already-finished species ─
     overall_downloaded = 0
+    for i in range(resume_from):
+        sp = all_species[i]
+        sp_path = os.path.join(data_dir, sp["name"])
+        existing = len(os.listdir(sp_path)) if os.path.exists(sp_path) else 0
+        overall_downloaded += min(existing, photos_per_species)
 
+    # ── Step 2: Download photos per species ─────────────────────────
     for idx, species in enumerate(all_species):
         if stop_event.is_set():
             break
 
-        name = species["name"]
+        # Skip already-completed species without touching the filesystem beyond
+        # a quick listdir — this is now only the pre-resume entries.
+        if idx < resume_from:
+            continue
+
+        name         = species["name"]
         display_name = species["display_name"]
-        taxon_id = species["id"]
-        save_path = os.path.join(data_dir, name)
+        taxon_id     = species["id"]
+        save_path    = os.path.join(data_dir, name)
 
         existing = len(os.listdir(save_path)) if os.path.exists(save_path) else 0
 
-        # Fetch Wikipedia data (skipped if files already exist)
+        # Fetch Wikipedia data (skipped if file already exists)
         _fetch_wiki(name, "wiki")
         time.sleep(1.5)  # polite delay — Wikipedia rate-limits aggressive clients
 
@@ -374,31 +437,36 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
         if existing >= photos_per_species:
             overall_downloaded += photos_per_species
             on_update({
-                "type": "download_species_done",
-                "species": display_name,
-                "species_idx": idx,
-                "downloaded": photos_per_species,
-                "total": photos_per_species,
-                "skipped": True,
-                "overall_pct": round(overall_downloaded / max(total_target, 1) * 100, 1),
+                "type":               "download_species_done",
+                "species":            display_name,
+                "species_idx":        idx,
+                "downloaded":         photos_per_species,
+                "total":              photos_per_species,
+                "skipped":            True,
+                "overall_pct":        round(overall_downloaded / max(total_target, 1) * 100, 1),
                 "overall_downloaded": overall_downloaded,
-                "overall_total": total_target,
+                "overall_total":      total_target,
+            })
+            _save_state({
+                "species_limit":      species_limit,
+                "photos_per_species": photos_per_species,
+                "species":            all_species,
+                "last_completed_idx": idx,
             })
             continue
 
         os.makedirs(save_path, exist_ok=True)
         on_update({
-            "type": "download_species_start",
-            "species": display_name,
-            "species_idx": idx,
+            "type":          "download_species_start",
+            "species":       display_name,
+            "species_idx":   idx,
             "total_species": total_species,
         })
 
-        # Paginate observations — API max 200/page; request extra since not
-        # every observation has its photos field populated
-        OBS_PAGE = 200
+        # Paginate observations — API max 200/page
+        OBS_PAGE   = 200
         downloaded = existing
-        obs_page = 1
+        obs_page   = 1
         while downloaded < photos_per_species and not stop_event.is_set():
             obs = get_observations(
                 taxon_id=taxon_id, photos=True, quality_grade='research',
@@ -416,18 +484,18 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
                         img_data = requests.get(img_url, timeout=5).content
                         with open(os.path.join(save_path, f"{photo['id']}.jpg"), 'wb') as f:
                             f.write(img_data)
-                        downloaded += 1
+                        downloaded       += 1
                         overall_downloaded += 1
                         on_update({
-                            "type": "download_progress",
-                            "species": display_name,
-                            "species_idx": idx,
-                            "downloaded": downloaded,
-                            "total": photos_per_species,
-                            "species_pct": round(downloaded / photos_per_species * 100, 1),
-                            "overall_pct": round(overall_downloaded / max(total_target, 1) * 100, 1),
+                            "type":               "download_progress",
+                            "species":            display_name,
+                            "species_idx":        idx,
+                            "downloaded":         downloaded,
+                            "total":              photos_per_species,
+                            "species_pct":        round(downloaded / photos_per_species * 100, 1),
+                            "overall_pct":        round(overall_downloaded / max(total_target, 1) * 100, 1),
                             "overall_downloaded": overall_downloaded,
-                            "overall_total": total_target,
+                            "overall_total":      total_target,
                         })
                     except Exception:
                         continue
@@ -436,18 +504,31 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
             obs_page += 1
 
         on_update({
-            "type": "download_species_done",
-            "species": display_name,
-            "species_idx": idx,
-            "downloaded": downloaded,
-            "total": photos_per_species,
-            "skipped": False,
-            "overall_pct": round(overall_downloaded / max(total_target, 1) * 100, 1),
+            "type":               "download_species_done",
+            "species":            display_name,
+            "species_idx":        idx,
+            "downloaded":         downloaded,
+            "total":              photos_per_species,
+            "skipped":            False,
+            "overall_pct":        round(overall_downloaded / max(total_target, 1) * 100, 1),
             "overall_downloaded": overall_downloaded,
-            "overall_total": total_target,
+            "overall_total":      total_target,
+        })
+
+        # Checkpoint progress so a restart can skip this species
+        _save_state({
+            "species_limit":      species_limit,
+            "photos_per_species": photos_per_species,
+            "species":            all_species,
+            "last_completed_idx": idx,
         })
 
     if stop_event.is_set():
         on_update({"type": "download_status", "status": "stopped"})
     else:
+        # Clean up state file — download is complete
+        try:
+            os.remove(_STATE_FILE)
+        except OSError:
+            pass
         on_update({"type": "download_status", "status": "done"})

@@ -1,0 +1,13 @@
+{
+  "appId": "com.natidex.app",
+  "appName": "NatiDex",
+  "webDir": ".",
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "Camera": {
+      "presentationStyle": "fullscreen"
+    }
+  }
+}
