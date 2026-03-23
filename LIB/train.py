@@ -323,13 +323,6 @@ def _train(on_update, data_dir, pause_event, stop_event):
         json.dump(idx_to_class, f)
 
     model     = _build_model(num_classes)
-    # torch.compile with reduce-overhead uses CUDA graphs (no Triton needed on Windows)
-    # — typically 15-30% faster after the first warm-up batch.
-    try:
-        model = torch.compile(model, backend="cudagraphs")
-        print("[NatiDex] torch.compile enabled (cudagraphs backend, no Triton needed)")
-    except Exception as e:
-        print(f"[NatiDex] torch.compile unavailable, running eager: {e}")
     # Label smoothing regularises the deep head and reduces overconfidence
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -340,7 +333,7 @@ def _train(on_update, data_dir, pause_event, stop_event):
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=1e-3, weight_decay=1e-4
+        lr=9e-3, weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=20, T_mult=2, eta_min=1e-5
@@ -367,7 +360,7 @@ def _train(on_update, data_dir, pause_event, stop_event):
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=5e-5, weight_decay=1e-4
+        lr=1e-4, weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-7
