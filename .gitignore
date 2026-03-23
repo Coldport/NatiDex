@@ -207,3 +207,5 @@ wiki_*
 
 # Marimo
 wiki/*
+best_model.pth
+class_labels.json

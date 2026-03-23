@@ -122,7 +122,7 @@ def _build_model(num_classes: int) -> nn.Module:
 
 # ── Single epoch (train or validate) ────────────────────────────────
 
-def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
+def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp, amp_dtype,
                pause_event, stop_event, on_update, phase, epoch):
     """Returns (avg_loss, accuracy) or (None, None) if stopped mid-epoch."""
     is_train      = optimizer is not None
@@ -144,7 +144,7 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                 out  = model(inputs)
                 loss = criterion(out, labels)
             scaler.scale(loss).backward()
@@ -154,7 +154,7 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
             scaler.step(optimizer)
             scaler.update()
         else:
-            with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with torch.no_grad(), torch.amp.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                 out  = model(inputs)
                 loss = criterion(out, labels)
 
@@ -190,8 +190,9 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp,
 def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
            scheduler, pause_event, stop_event, phase, max_epochs, num_classes):
 
-    use_amp = device.type == "cuda"
-    scaler  = torch.amp.GradScaler(device.type, enabled=use_amp)
+    use_amp   = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp else None  # BF16 is native+faster on Blackwell
+    scaler    = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     best_val_loss = float('inf')
     best_state    = None
@@ -202,13 +203,13 @@ def _phase(on_update, model, train_loader, val_loader, criterion, optimizer,
             break
 
         train_loss, train_acc = _run_epoch(
-            model, train_loader, criterion, optimizer, scaler, use_amp,
+            model, train_loader, criterion, optimizer, scaler, use_amp, amp_dtype,
             pause_event, stop_event, on_update, phase, epoch + 1)
         if train_loss is None:
             break
 
         val_loss, val_acc = _run_epoch(
-            model, val_loader, criterion, None, scaler, use_amp,
+            model, val_loader, criterion, None, scaler, use_amp, amp_dtype,
             pause_event, stop_event, on_update, phase, epoch + 1)
         if val_loss is None:
             break
@@ -284,21 +285,23 @@ def _train(on_update, data_dir, pause_event, stop_event):
     idx     = torch.randperm(n_total, generator=g).tolist()
 
     use_cuda = device.type == "cuda"
-    # With batch=64, each prefetched batch is 4× smaller than batch=256 was,
-    # so we can safely push workers and prefetch back up to keep the GPU fed.
-    nw = 8 if use_cuda else 0
-    BATCH = 64
+    # VRAM at batch=128 was only 6/16 GB — double again to fill the headroom.
+    nw = 4 if use_cuda else 0
+    BATCH = 256
+    # pin_memory_device="" tells PyTorch to pin directly to the CUDA device,
+    # saving one CPU→GPU memcpy per batch on Windows.
+    pin_dev = "cuda" if use_cuda else ""
     train_loader = DataLoader(
         Subset(ds_train, idx[:n_train]),
-        batch_size=BATCH, shuffle=True,
-        num_workers=nw, pin_memory=use_cuda,
-        persistent_workers=(nw > 0), prefetch_factor=(4 if nw > 0 else None),
+        batch_size=BATCH, shuffle=True, drop_last=True,
+        num_workers=nw, pin_memory=use_cuda, pin_memory_device=pin_dev,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
     val_loader = DataLoader(
         Subset(ds_val, idx[n_train:]),
-        batch_size=BATCH, shuffle=False,
-        num_workers=nw, pin_memory=use_cuda,
-        persistent_workers=(nw > 0), prefetch_factor=(4 if nw > 0 else None),
+        batch_size=BATCH, shuffle=False, drop_last=True,
+        num_workers=nw, pin_memory=use_cuda, pin_memory_device=pin_dev,
+        persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
     )
 
     num_classes = len(ds_train.classes)
@@ -320,6 +323,13 @@ def _train(on_update, data_dir, pause_event, stop_event):
         json.dump(idx_to_class, f)
 
     model     = _build_model(num_classes)
+    # torch.compile with reduce-overhead uses CUDA graphs (no Triton needed on Windows)
+    # — typically 15-30% faster after the first warm-up batch.
+    try:
+        model = torch.compile(model, backend="cudagraphs")
+        print("[NatiDex] torch.compile enabled (cudagraphs backend, no Triton needed)")
+    except Exception as e:
+        print(f"[NatiDex] torch.compile unavailable, running eager: {e}")
     # Label smoothing regularises the deep head and reduces overconfidence
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
