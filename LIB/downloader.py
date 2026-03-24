@@ -358,8 +358,9 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
             on_update({"type": "download_status", "status": "fetching_species",
                        "kingdom_id": k_id})
             page = 1
-            while len(all_species) < species_limit:
-                need = species_per_kingdom - len(all_species)
+            k_fetched = 0
+            while k_fetched < species_per_kingdom:
+                need = species_per_kingdom - k_fetched
                 counts = get_observation_species_counts(
                     taxon_id=k_id, quality_grade='research',
                     per_page=min(API_MAX, need), page=page
@@ -375,6 +376,7 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
                         "id":           taxon['id'],
                         "common_name":  taxon.get('preferred_common_name', ''),
                     })
+                    k_fetched += 1
                 if len(results) < min(API_MAX, need):
                     break
                 page += 1
