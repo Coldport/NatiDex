@@ -298,23 +298,24 @@ class DownloadController:
     def stop(self):
         self._stop.set()
 
-    def start(self, on_update, species_limit=400, photos_per_species=50, data_dir="data"):
+    def start(self, on_update, animal_limit=1250, plant_limit=1250, photos_per_species=50, data_dir="data"):
         self._running = True
         self._stop.clear()
         try:
-            _download(on_update, self._stop, species_limit, photos_per_species, data_dir)
+            _download(on_update, self._stop, animal_limit, plant_limit, photos_per_species, data_dir)
         finally:
             self._running = False
 
 
-def _load_state(species_limit, photos_per_species):
+def _load_state(animal_limit, plant_limit, photos_per_species):
     """Load saved download state if it exists and matches current params."""
     if not os.path.exists(_STATE_FILE):
         return None
     try:
         with open(_STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
-        if (state.get("species_limit") == species_limit and
+        if (state.get("animal_limit") == animal_limit and
+                state.get("plant_limit") == plant_limit and
                 state.get("photos_per_species") == photos_per_species):
             return state
     except Exception:
@@ -330,12 +331,16 @@ def _save_state(state):
         pass
 
 
-def _download(on_update, stop_event, species_limit, photos_per_species, data_dir):
-    kingdoms = [1, 47126]  # Animals, Plants
-    species_per_kingdom = species_limit // len(kingdoms)
+def _download(on_update, stop_event, animal_limit, plant_limit, photos_per_species, data_dir):
+    # Build list of (taxon_id, limit) pairs for requested kingdoms
+    kingdoms = []
+    if animal_limit > 0:
+        kingdoms.append({"id": 1,     "limit": animal_limit, "name": "Animals"})
+    if plant_limit > 0:
+        kingdoms.append({"id": 47126, "limit": plant_limit,  "name": "Plants"})
 
     # ── Step 1: Load saved state OR fetch species from API ───────────
-    state = _load_state(species_limit, photos_per_species)
+    state = _load_state(animal_limit, plant_limit, photos_per_species)
 
     if state is not None:
         all_species   = state["species"]
@@ -352,17 +357,17 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
         # Fresh start — fetch all species metadata from iNaturalist
         API_MAX = 500
         all_species = []
-        for k_id in kingdoms:
+        for k in kingdoms:
             if stop_event.is_set():
                 break
             on_update({"type": "download_status", "status": "fetching_species",
-                       "kingdom_id": k_id})
+                       "kingdom_id": k["id"]})
             page = 1
             k_fetched = 0
-            while k_fetched < species_per_kingdom:
-                need = species_per_kingdom - k_fetched
+            while k_fetched < k["limit"]:
+                need = k["limit"] - k_fetched
                 counts = get_observation_species_counts(
-                    taxon_id=k_id, quality_grade='research',
+                    taxon_id=k["id"], quality_grade='research',
                     per_page=min(API_MAX, need), page=page
                 )
                 results = counts.get('results', [])
@@ -375,6 +380,7 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
                         "display_name": taxon['name'],
                         "id":           taxon['id'],
                         "common_name":  taxon.get('preferred_common_name', ''),
+                        "kingdom":      k["name"],
                     })
                     k_fetched += 1
                 if len(results) < min(API_MAX, need):
@@ -384,7 +390,8 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
         resume_from = 0
         # Persist species list immediately so future restarts can skip this step
         _save_state({
-            "species_limit":       species_limit,
+            "animal_limit":        animal_limit,
+            "plant_limit":         plant_limit,
             "photos_per_species":  photos_per_species,
             "species":             all_species,
             "last_completed_idx":  -1,
@@ -450,7 +457,8 @@ def _download(on_update, stop_event, species_limit, photos_per_species, data_dir
                 "overall_total":      total_target,
             })
             _save_state({
-                "species_limit":      species_limit,
+                "animal_limit":       animal_limit,
+                "plant_limit":        plant_limit,
                 "photos_per_species": photos_per_species,
                 "species":            all_species,
                 "last_completed_idx": idx,

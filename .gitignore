@@ -210,3 +210,6 @@ wiki/*
 best_model.pth
 class_labels.json
 best_model.pth
+class_labels.json
+common_names.json
+download_state.json

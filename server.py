@@ -239,7 +239,8 @@ async def train_stop():
 # ── Download routes ──────────────────────────────────────────────────
 
 class DownloadConfig(BaseModel):
-    species_limit: int = 400
+    animal_limit: int = 1250
+    plant_limit: int = 1250
     photos_per_species: int = 50
 
 @app.post("/download/start")
@@ -249,7 +250,8 @@ async def download_start(cfg: DownloadConfig):
     threading.Thread(
         target=downloader.start,
         args=(sync_broadcast,),
-        kwargs={"species_limit": cfg.species_limit, "photos_per_species": cfg.photos_per_species},
+        kwargs={"animal_limit": cfg.animal_limit, "plant_limit": cfg.plant_limit,
+                "photos_per_species": cfg.photos_per_species},
         daemon=True,
     ).start()
     return {"status": "started"}
