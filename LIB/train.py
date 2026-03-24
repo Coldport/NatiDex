@@ -10,6 +10,28 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 
+
+class _SafeSubset(torch.utils.data.Dataset):
+    """Wraps a Subset and silently skips corrupt/unreadable images."""
+    def __init__(self, subset):
+        self.subset = subset
+
+    def __len__(self):
+        return len(self.subset)
+
+    def __getitem__(self, idx):
+        try:
+            return self.subset[idx]
+        except Exception:
+            return None
+
+
+def _safe_collate(batch):
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+    return torch.utils.data.dataloader.default_collate(batch)
+
 torch.backends.cudnn.benchmark = True   # optimise kernels for fixed input size
 torch.backends.cuda.matmul.allow_tf32 = True  # TF32 matmul (Ampere/Blackwell)
 torch.backends.cudnn.allow_tf32       = True  # TF32 convolutions
@@ -134,7 +156,10 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, use_amp, amp_dtype,
     correct    = 0
     total      = 0
 
-    for batch_idx, (inputs, labels) in enumerate(loader):
+    for batch_idx, batch in enumerate(loader):
+        if batch is None:
+            continue
+        inputs, labels = batch
         pause_event.wait()
         if stop_event.is_set():
             return None, None
@@ -292,16 +317,18 @@ def _train(on_update, data_dir, pause_event, stop_event):
     # saving one CPU→GPU memcpy per batch on Windows.
     pin_dev = "cuda" if use_cuda else ""
     train_loader = DataLoader(
-        Subset(ds_train, idx[:n_train]),
+        _SafeSubset(Subset(ds_train, idx[:n_train])),
         batch_size=BATCH, shuffle=True, drop_last=True,
         num_workers=nw, pin_memory=use_cuda, pin_memory_device=pin_dev,
         persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
+        collate_fn=_safe_collate,
     )
     val_loader = DataLoader(
-        Subset(ds_val, idx[n_train:]),
+        _SafeSubset(Subset(ds_val, idx[n_train:])),
         batch_size=BATCH, shuffle=False, drop_last=True,
         num_workers=nw, pin_memory=use_cuda, pin_memory_device=pin_dev,
         persistent_workers=(nw > 0), prefetch_factor=(2 if nw > 0 else None),
+        collate_fn=_safe_collate,
     )
 
     num_classes = len(ds_train.classes)
