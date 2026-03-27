@@ -401,7 +401,13 @@ def _download(on_update, stop_event, animal_limit, plant_limit, photos_per_speci
     total_target  = total_species * photos_per_species
 
     # Always refresh common names mapping (cheap, instant)
-    common_names = {s["name"]: s["common_name"] for s in all_species if s["common_name"]}
+    # Merge new common names into existing file so trained-model lookups still work
+    try:
+        with open("common_names.json", encoding="utf-8") as f:
+            common_names = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        common_names = {}
+    common_names.update({s["name"]: s["common_name"] for s in all_species if s["common_name"]})
     with open("common_names.json", "w", encoding="utf-8") as f:
         json.dump(common_names, f, ensure_ascii=False)
 
@@ -527,7 +533,8 @@ def _download(on_update, stop_event, animal_limit, plant_limit, photos_per_speci
 
         # Checkpoint progress so a restart can skip this species
         _save_state({
-            "species_limit":      species_limit,
+            "animal_limit":       animal_limit,
+            "plant_limit":        plant_limit,
             "photos_per_species": photos_per_species,
             "species":            all_species,
             "last_completed_idx": idx,

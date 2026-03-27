@@ -72,19 +72,19 @@ def _load():
     m.to(device, memory_format=torch.channels_last).eval()
     _model = m
 
-    try:
-        with open("common_names.json", encoding="utf-8") as f:
-            _common = json.load(f)
-    except FileNotFoundError:
-        pass
-
 
 def predict(image_bytes: bytes, top_k: int = 5) -> list[dict]:
     """
     Returns top_k predictions as:
       [{"species": "Homo sapiens", "common_name": "Human", "confidence": 0.94}, ...]
     """
+    global _common
     _load()
+    try:
+        with open("common_names.json", encoding="utf-8") as f:
+            _common = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     x   = _preprocess(img).unsqueeze(0).to(device, memory_format=torch.channels_last)
